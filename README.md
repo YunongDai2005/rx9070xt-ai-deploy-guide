@@ -2,6 +2,8 @@
 
 **面向 AI 助手的结构化参考数据** · AMD Radeon RX 9070 XT (gfx1201) · Windows 11 原生 · 16 GB VRAM
 
+**中文** · [English](README.en.md)
+
 ---
 
 ## 这份文档是什么
@@ -21,7 +23,7 @@
 | 对话 | MN-12B-Mag-Mell-R1 (Q6_K, 9.4 GiB) | llama.cpp · ROCm | §3.2 |
 | 文生图 | Qwen-Image 2.1（int8_convrot / Q8_0 / Q4_K_M） | ComfyUI · PyTorch ROCm | §5 |
 | 文生图 | + Pruna 8 步蒸馏 LoRA | ComfyUI | §5.1 |
-| 文生视频 | MiniMax H3（视频 + 音频双 VAE，53 GiB） | ComfyUI · PyTorch ROCm | §6 |
+| 文生视频 | MiniMax H3（53 GiB）— 视频 ✅ 277.87 s / 音频 ⚠️ 未通 | ComfyUI · PyTorch ROCm | §6 |
 | 文生图 | RealVisXL V5.0 (SDXL, 6.9 GiB) | ComfyUI **和** ForgeNeo | §7 |
 | 前端 | Open WebUI :8080 | 接 Ollama | §8.1 |
 | 前端 | SillyTavern :8000 | 接 llama.cpp OpenAI 兼容端点 | §8.2 |
@@ -89,11 +91,20 @@ python -c "import torch;print(torch.__version__, torch.version.hip, torch.cuda.g
 |---|---|
 | ✅ 可用 | `int8_convrot`、`w4a8_int8_linear`、`svdquant_w4a4`、`gemv_awq_w4a16`、`per_tensor_fp8`、`sol_attn`、`na3d`、`fp16_conv3d`、`rms_rope*`、`adaln` |
 | ❌ 缺失 | `dequantize_int8_convrot_weight`（仅有 `_dtype` 变体）、`dequantize_int8_simple`（同）、`rotate_int8_convrot_weight`、`prepare_int4_weight_for_int8_linear` |
-| ❌ 不适用 | `nvfp4` 全系、`mxfp8` 全系（NVIDIA 专属） |
+| ⚠️ **模拟执行** | `nvfp4`、`mxfp8` —— 不报错，但走软件模拟路径，不是原生算子 |
+
+运行时日志会明确列出这个区分（来自 §6.4 的实测日志）：
+
+```
+Native ops:   float8_e5m2, int8_tensorwise, asym_w4a8_int8, convrot_w4a4, float8_e4m3fn
+emulated ops: nvfp4, mxfp8
+```
 
 `int8_convrot` 数值校验：`relative_rmse = 0.0126`，`finite = true`，输出 `bf16`。**精度可接受。**
 
-**推论：给 RDNA4 推荐量化格式时，`int8_convrot` 和 GGUF 是安全选择；任何 `nvfp4`/`mxfp8` 方案直接排除。**
+**推论：给 RDNA4 推荐量化格式时，`int8_convrot` 和 GGUF 是安全选择。
+`nvfp4` / `mxfp8` 能跑但是模拟的 —— 不会崩，但拿不到量化本该带来的加速，属于"看起来能用实际白费"，
+给建议时要说清楚。**
 
 ---
 
@@ -513,6 +524,101 @@ venv\Scripts\python.exe main.py ^
 
 `--disable-dynamic-vram --reserve-vram 1` 是 H3 专用，其他工作流不需要加。
 
+### 6.4 实测跑分
+
+**单次成功运行：10 步，总计 277.87 秒。** 数据来自运行日志，非推算。
+
+机器可用资源：`Total VRAM 16304 MB, total RAM 32683 MB`，`vram state = NORMAL_VRAM`。
+
+#### 模型加载：两个都是"部分加载"，但都没退化成 lowvram
+
+| 模型 | 可用 | 实际载入 GPU | 卸载到 CPU | 缓冲保留 | **lowvram patches** |
+|---|---|---|---|---|---|
+| 文本编码器（Qwen3-VL 32B, 25.3 GiB） | 14293.74 MB | 13418.44 MB | **12465.00 MB** | 875.29 MB | **0** ✅ |
+| 扩散模型（19.5 GiB） | 13866.61 MB | 13386.64 MB | **6609.51 MB** | 661.52 MB | **0** ✅ |
+
+> **`lowvram patches: 0` 是这里最关键的一行。**
+> 模型确实被拆开了（合计约 19 GB 卸到 CPU），但**没有触发 ComfyUI 的 lowvram 降级路径** ——
+> 也就是说 §5.4 说的那种断崖式降速在 H3 这条路上没有发生。
+> 排障时先 grep 这一行：非 0 就说明落进了降级路径。
+
+另外注意：25.3 GiB 的编码器需要把 12.5 GB 卸到 CPU，而这台机器只有 32 GB RAM。
+**这正是 §6.1 的 mmap 方案除了绕过崩溃之外的第二个价值** ——
+只读的文件映射页不计入 commit charge，否则 32 GB 内存也会很紧张。
+
+#### 采样：10 步 55 秒
+
+```
+ 1/10  13.41 s/it   ← 首步含 kernel 编译
+ 2/10   8.82 s/it
+ 3/10   7.81 s/it
+ 4/10   7.30 s/it
+ 5/10   6.53 s/it
+ 6/10   5.57 s/it
+ 7/10   5.00 s/it
+ 8/10   4.45 s/it
+ 9/10   4.14 s/it
+10/10   3.98 s/it   ← 收敛值
+────────────────────
+总计 55 s，平均 5.52 s/it
+```
+
+**首步 13.41 s、末步 3.98 s，相差 3.4 倍。** 首步包含 MIOpen kernel 选择和
+AOTriton 注意力内核的首次编译，之后单调收敛到约 4 s/it。
+**评估 H3 性能时必须用收敛值，用首步或平均值都会低估这张卡。**
+
+日志里能看到 `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` 确实生效了：
+
+```
+UserWarning: Using AOTriton backend for Efficient Attention forward...
+(aten/src/ATen/native/transformers/hip/attention.hip:1452)
+```
+
+#### 时间去向拆解
+
+| 阶段 | 耗时 | 占比 |
+|---|---|---|
+| 模型加载 + 文本编码（53 GiB 权重从机械盘读入 + 量化解包） | ~215 s | **77%** |
+| 采样（10 步） | 55 s | 20% |
+| 双 VAE 解码 | ~8 s | 3% |
+| **合计** | **277.87 s** | |
+
+> **瓶颈是加载，不是计算。** 采样只占 20%。
+> 想加快 H3，方向是把权重挪到 SSD / 减少重复加载，而不是调采样参数。
+> （本机 H3 权重在机械盘上，日志里 `fast_disk=False` 就是这个意思。）
+
+#### VAE 解码阶段
+
+```
+[H3-VRAM-Gate] free VRAM 15359 -> 15357 MB
+Requested to load MiniMaxH3AudioVAE  → 577.08 MB, full load: True
+Requested to load MiniMaxH3VideoVAE  → 4966.19 MB, full load: True
+```
+
+`model_type FLOW_AV` —— 音视频联合流模型，音频和视频各一个 VAE，都是完整加载。
+
+⚠️ **诚实说明**：这次运行里门控节点只释放了 2 MB（15359 → 15357），
+说明采样结束时 ComfyUI 已经自己把模型驱逐干净了。
+**所以这条日志不能证明门控节点"救了"这次运行** —— 它在这一次更像是保险而非必需。
+它的价值在于保证时序确定：不依赖 ComfyUI 恰好做对。
+
+### 6.5 未解决问题：音频分支报 `audio_scale`
+
+第二次运行在 148.23 秒时失败：
+
+```
+!!! Exception during processing !!!
+AttributeError: 'ModelSamplingAdvanced' object has no attribute 'audio_scale'
+```
+
+`model_type` 是 `FLOW_AV`（音视频联合），采样节点需要携带 `audio_scale` 属性，
+而 `ModelSamplingAdvanced` 没有这个属性。**换用支持 AV 的采样节点即可，
+但本机尚未验证哪个节点是对的，所以音频分支目前算未跑通。**
+
+> 视频分支（277.87 s 那次）是完整成功的。这个报错只影响音频输出。
+> 如果你在 H3 上遇到同样的报错，**不是 RDNA4 的问题** —— 是节点选择问题，
+> 和显卡无关，NVIDIA 上同样会报。
+
 ---
 
 ## 7. SDXL 文生图（ComfyUI / ForgeNeo 双前端）
@@ -679,6 +785,9 @@ dataRoot: ./data
 | SDXL 加了 RDNA4 参数没变化 | SDXL 本来就不需要那套（§4.2） | 去掉，从模型/VAE/前端配置方向查 |
 | Open WebUI 打开就是报错页 | 服务还没就绪就开了浏览器 | 轮询 `/health` 就绪后再开（§8.1） |
 | Windows 上想看显存占用但没有 nvidia-smi | AMD 卡无此工具 | 读性能计数器 `\GPU Adapter Memory(*)\Dedicated Usage`（§8.1） |
+| H3 报 `'ModelSamplingAdvanced' object has no attribute 'audio_scale'` | `FLOW_AV` 需要支持音视频的采样节点 | 换采样节点（§6.5）。**与 RDNA4 无关**，NVIDIA 上同样报 |
+| 想判断模型有没有退化成 lowvram | 部分加载 ≠ lowvram 降级 | grep 日志 `lowvram patches:`，非 0 才是降级（§6.4） |
+| H3 很慢，调采样参数没用 | 瓶颈是加载不是计算，采样只占 20% | 权重挪到 SSD；日志里 `fast_disk=False` 就是慢盘标志（§6.4） |
 
 ---
 
