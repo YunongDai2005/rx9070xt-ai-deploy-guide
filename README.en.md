@@ -4,6 +4,10 @@
 
 [中文](README.md) · **English**
 
+📋 **Companion document: [RUNLOGS.en.md](RUNLOGS.en.md)** — real logs annotated section by
+section, an expectations table, and a quick self-check list. **Knowing what a healthy log
+looks like before you deploy is much faster than debugging after it breaks.**
+
 ---
 
 ## What this document is
@@ -73,6 +77,43 @@ Three things worth noting:
 | `Qwen21ScheduledSingleImageEdit` | ComfyUI partial unload → lowvram slowdown |
 | `H3UnloadBeforeDecode` | Model co-residency in 16 GB → HIP launch failure |
 | `large_safetensors` (monkey patch) | safetensors 0.8.0 crashes on Windows reading files > 21 GiB |
+
+### ⚠️ Content rating disclosure (NSFW / uncensored models)
+
+**Three models in this deployment are uncensored or unrestricted and can produce NSFW output.**
+This is stated explicitly because anyone following this document deserves to know what they
+are installing.
+
+| Model | Category | Note |
+|---|---|---|
+| Qwen3.8 27B **abliterated** | Uncensored (weight-edited) | `abliterated` means refusal behavior was removed via weight orthogonalization. **It will not refuse any request**, including things the original model would decline |
+| Qwen3-VL 32B **ultra_uncensored** variant | Uncensored | H3's alternate text encoder. Using it in the video pipeline means generation is not constrained by prompt-level filtering |
+| MN-12B-Mag-Mell-R1 | Community roleplay fine-tune | Aimed at roleplay / creative writing, with no built-in limits on adult content |
+
+**Practical deployment implications — these are technical points, not a lecture:**
+
+1. **§8.2's `whitelistMode: true` for SillyTavern is not optional in this context.**
+   Turning it off exposes uncensored models plus your entire chat history to the whole LAN.
+2. **Same for §8.1's `WEBUI_AUTH=False` in Open WebUI** — valid only under strict loopback
+   (`127.0.0.1`). Enable auth before ever changing it to `0.0.0.0`.
+3. **In §8.3, `llama-server` runs with `--host 0.0.0.0` and no authentication** — the only
+   service in the stack that is LAN-reachable by default. If it has an uncensored model
+   loaded, any device on the subnet can call it directly. Change it to `127.0.0.1` unless you
+   genuinely need remote access.
+4. **Not suitable for multi-user, shared, or minor-accessible environments.** These models do
+   not self-restrict; access control is the only boundary.
+5. Everything runs locally with telemetry off (`HF_HUB_DISABLE_TELEMETRY=1`,
+   `--disable-api-nodes`), so output never leaves the machine — which also means
+   responsibility for that output sits entirely with the operator.
+
+> **If you only want to reproduce the performance data and don't need the uncensored behavior**:
+> substitute the official `Qwen3.5` or `Qwen3.8` release at the same quantization for the 27B.
+> **Every benchmark, VRAM figure and RDNA4 conclusion in this document is unchanged** — they
+> depend on parameter count and quantization format, not on whether refusals were removed.
+> H3's primary encoder (first row of the §6 table) is also a standard build; the video
+> pipeline does not require an uncensored variant.
+
+This repository **distributes no model weights** — it documents deployment parameters only.
 
 ### Notes for AI assistants
 
