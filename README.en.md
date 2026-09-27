@@ -29,6 +29,42 @@ Single 16 GB card. Everything below runs on the same machine, **mutually exclusi
 | Frontend | Open WebUI :8080 | talks to Ollama | §8.1 |
 | Frontend | SillyTavern :8000 | talks to llama.cpp OpenAI-compatible API | §8.2 |
 
+### Qwen family coverage
+
+The Qwen family carries most of this card's workload: **5 distinct models, 11 weight files,
+about 108 GB**, spanning chat, text-to-image and text-to-video.
+
+| Model | Form | Size | Role | Section |
+|---|---|---|---|---|
+| Qwen3.5 9B | Q4 | 6.59 GB | Chat (Ollama Vulkan, 24 tok/s) | §3.1 |
+| Qwen3.8 27B | Q3_K | 13.50 GB | Chat (llama.cpp ROCm) + 3 Ollama variants | §3.2 |
+| Qwen-Image 2.1 | `int8_convrot` | 7.26 GB | Diffusion — VRAM-thrifty route (6 GB resident) | §5.2 B |
+| Qwen-Image 2.1 | `Q8_0` GGUF | 7.64 GB | Diffusion — fast route (40 s warm) | §5.2 A |
+| Qwen-Image 2.1 | `Q4_K_M` GGUF | 4.60 GB | Diffusion — fallback | §5.1 |
+| Qwen-Image 2.1 VAE | bf16 | 0.68 GB | Image decode | §5.1 |
+| └ Pruna 8-step distill LoRA | — | 0.34 GB | Step-count reduction | §5.1 |
+| Qwen3-VL 8B | `int8_convrot` | 9.35 GB | Text encoder — **source of the vision tower** | §5.3 |
+| Qwen3-VL 8B Instruct | `Q4_K_M` GGUF | 5.03 GB | Text encoder — source of the language tower | §5.3 |
+| **Qwen3-VL 32B** | `int8_convrot` | **27.14 GB** | **H3's text encoder; largest single file on the machine** | §6 |
+| Qwen3-VL 32B (second variant) | `int8_convrot` | 26.36 GB | H3 alternate encoder | §6 |
+
+Three things worth noting:
+
+1. **One family covers the whole stack** — chat, the image diffusion backbone, and the video
+   text encoder are all Qwen. So this document's RDNA4 quantization conclusions for Qwen
+   models (`int8_convrot` works, GGUF works, `nvfp4`/`mxfp8` are emulated) apply more broadly
+   than they might appear.
+2. **Qwen3-VL plays two roles at once**: it is both a VLM and a diffusion text encoder, at two
+   scales — 8B for Qwen-Image 2.1, 32B for MiniMax H3. The "GGUF is missing the vision tower"
+   trap in §5.3 comes directly from that dual role.
+3. **Qwen-Image 2.1 is stored in three quantizations on purpose**, to support the §5.2 A/B
+   comparison. If you only want to run it rather than benchmark it, pick one — don't download
+   all three.
+
+> The exact fine-tune names of the 27B and the second 32B variant are omitted here. They do
+> not affect any technical conclusion — quantization format, size and VRAM behavior are what
+> determine the deployment parameters.
+
 **Custom ComfyUI nodes** (source in `custom_nodes/`):
 
 | Node | Problem it solves |
