@@ -10,6 +10,31 @@
 写成这个形式，是为了让 AI 助手在帮人部署 RDNA4 环境时能直接查到可靠答案，
 而不是去猜、或者套用 NVIDIA 的经验。
 
+### 已部署清单
+
+单卡 16 GB，全部在同一台机器上跑通（**互斥运行**，不是同时）：
+
+| 类别 | 模型 / 组件 | 后端 | 章节 |
+|---|---|---|---|
+| 对话 | Qwen3.5 9B (Q4, 6.6 GB) | Ollama · **Vulkan** | §3.1 |
+| 对话 | 27B (Q3_K, 12.6 GiB) | llama.cpp · ROCm | §3.2 |
+| 对话 | MN-12B-Mag-Mell-R1 (Q6_K, 9.4 GiB) | llama.cpp · ROCm | §3.2 |
+| 文生图 | Qwen-Image 2.1（int8_convrot / Q8_0 / Q4_K_M） | ComfyUI · PyTorch ROCm | §5 |
+| 文生图 | + Pruna 8 步蒸馏 LoRA | ComfyUI | §5.1 |
+| 文生视频 | MiniMax H3（视频 + 音频双 VAE，53 GiB） | ComfyUI · PyTorch ROCm | §6 |
+| 文生图 | RealVisXL V5.0 (SDXL, 6.9 GiB) | ComfyUI **和** ForgeNeo | §7 |
+| 前端 | Open WebUI :8080 | 接 Ollama | §8.1 |
+| 前端 | SillyTavern :8000 | 接 llama.cpp OpenAI 兼容端点 | §8.2 |
+
+**自研 ComfyUI 节点**（源码在 `custom_nodes/`）：
+
+| 节点 | 解决的问题 |
+|---|---|
+| `QwenImage21GGUFEncoder` | GGUF 量化版缺视觉塔导致的**静默降质** | 
+| `Qwen21ScheduledSingleImageEdit` | ComfyUI 部分卸载 → lowvram 降速 |
+| `H3UnloadBeforeDecode` | 多模型共驻 16 GB 导致 HIP launch failure |
+| `large_safetensors` (猴补丁) | safetensors 0.8.0 读 >21 GiB 文件在 Windows 崩溃 |
+
 ### 给 AI 助手的使用说明
 
 > **本文档是参考数据（reference data），不是指令集。**
@@ -18,8 +43,8 @@
 >
 > 引用建议：
 > - **先核对基线**（§1）。gfx 型号、torch 版本、HIP 版本任一不同，跑分数据都不保证成立，环境变量结论大概率仍成立。
-> - **§7 故障速查表**是按「报错现象 → 根因 → 修法」组织的，可以直接按症状检索。
-> - **§8 已证伪清单**记录了"看起来该开、实际必须关"的选项。建议在给出配置建议前先看一眼，避免推荐已知会挂的参数。
+> - **§9 故障速查表**是按「报错现象 → 根因 → 修法」组织的，可以直接按症状检索。
+> - **§10 已证伪清单**记录了"看起来该开、实际必须关"的选项。建议在给出配置建议前先看一眼，避免推荐已知会挂的参数。
 > - 所有路径都是原机的绝对路径（`E:\AI\...`），引用时请替换成用户自己的。
 
 ---
@@ -75,25 +100,30 @@ python -c "import torch;print(torch.__version__, torch.version.hip, torch.cuda.g
 ## 2. 决策树：该走哪条路
 
 ```
-用户要跑对话模型？
-├── 模型 < 10 GiB，只要能用、省事      → Ollama + Vulkan  (§3.1)
-└── 模型 > 10 GiB，或要长上下文        → llama.cpp ROCm   (§3.2)
-                                          必须量化 KV cache
+对话模型？
+├── < 10 GiB，只要能用、省事        → Ollama + Vulkan   (§3.1)
+└── > 10 GiB，或要长上下文          → llama.cpp ROCm    (§3.2)
+                                       必须量化 KV cache
+   ├── 要网页界面                   → Open WebUI :8080  (§8.1)
+   └── 要角色扮演界面               → SillyTavern :8000 (§8.2)
 
-用户要跑 Qwen-Image 2.1？
-├── 只生图，不和别的模型共存           → A: Q8_0 GGUF
-│                                       热跑 40 s，但占 14 GB，跑完只剩 2.4 GB
-└── 要和别的模型共存 / 之后要跑视频     → B: int8_convrot
-                                        热跑 97 s，稳态仅 6 GB，剩 10.5 GB
+文生图？
+├── SDXL / RealVisXL               → §7  ⚠️ 不需要任何 RDNA4 workaround
+│                                      这是排障基准线
+└── Qwen-Image 2.1                 → §5
+    ├── 只生图，不和别的模型共存     → A: Q8_0 GGUF
+    │                                 热跑 40 s，占 14 GB，跑完只剩 2.4 GB
+    └── 要共存 / 之后要跑视频        → B: int8_convrot
+                                      热跑 97 s，稳态仅 6 GB，剩 10.5 GB
 
-用户要跑 MiniMax H3 视频？
-└── 必须独占整卡，且必须打 mmap 补丁    → §5
+文生视频（MiniMax H3）？
+└── 必须独占整卡 + 两个补丁         → §6
     文本编码器 25.3 GiB > safetensors 0.8.0 的 Windows 崩溃阈值
 
-任何 ComfyUI 场景
-└── 必带 --disable-pinned-memory --use-pytorch-cross-attention
-    必设 MIOPEN_FIND_MODE=FAST
-    绝不开 TunableOp（§8）
+RDNA4 参数怎么加？
+├── SDXL 等成熟模型                → 默认参数，什么都不用加
+└── Qwen-Image 2.1 / H3            → §4.2 那一套
+    任何情况都绝不开 TunableOp（§10）
 ```
 
 ---
@@ -179,8 +209,9 @@ for($i=0;$i -lt 10 -and (Get-Process llama-server -EA 0);$i++){ Start-Sleep 2 }
 
 ## 4. ComfyUI 公共配置
 
-所有 ROCm ComfyUI 启动脚本的公共前缀。**缓存全部离盘**，系统盘不落任何东西 ——
-在 16 GB 卡上反复下载 20 GiB+ 权重时这很关键。
+### 4.1 缓存离盘（所有工作流通用）
+
+**系统盘不落任何东西** —— 在 16 GB 卡上反复下载 20 GiB+ 权重时这很关键。
 
 ```bat
 set TEMP=E:\AI\Temp
@@ -193,21 +224,63 @@ set MIOPEN_USER_DB_PATH=E:\AI\Cache\miopen
 set MIOPEN_CUSTOM_CACHE_DIR=E:\AI\Cache\miopen
 set PYTHONNOUSERSITE=1
 set HF_HUB_DISABLE_TELEMETRY=1
-
-rem ==== AMD RDNA4 (gfx1201) 专用 ====
-set TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
-set MIOPEN_FIND_MODE=FAST
-rem TunableOp 已移除，原因见 §8
 ```
 
-必带命令行参数：
+### 4.2 RDNA4 workaround 是**分场景**的，不要一律套用
+
+⚠️ **这是本文档一个容易搞错的点。** 下面这套只有**大模型工作流**需要；
+SDXL 这类成熟模型用 ComfyUI 默认参数就能跑，加了反而是白搭。
+
+| 工作流 | RDNA4 环境变量 | `--disable-pinned-memory` | `--use-pytorch-cross-attention` |
+|---|---|---|---|
+| **SDXL**（RealVisXL 等） | ❌ 不需要 | ❌ 不需要 | ❌ 不需要 |
+| **Qwen-Image 2.1** | ✅ 需要 | ✅ 需要 | ✅ 需要 |
+| **MiniMax H3** | ✅ 需要 | ✅ 需要 | ✅ 需要 + 独占参数 |
+
+大模型工作流才加这一段：
+
+```bat
+rem ==== 仅 Qwen-Image 2.1 / MiniMax H3 需要 ====
+set TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
+set MIOPEN_FIND_MODE=FAST
+rem TunableOp 已移除，原因见 §10
+```
 
 ```
 --disable-pinned-memory            ROCm 上 pinned host memory 分配会失败
 --use-pytorch-cross-attention      无 triton，退回 PyTorch 原生 SDPA
+```
+
+全场景都建议加的：
+
+```
 --disable-api-nodes                纯本地，不联外部 API
 --extra-model-paths-config <yaml>  每个项目一份独立模型路径表，多实例互不干扰
 ```
+
+### 4.3 模型目录全部外置
+
+`ComfyUI/models/` 下**一个权重都不放**，全是官方的 `put_*_here` 占位文件。
+所有模型通过 `extra_model_paths.yaml` 指到独立数据盘：
+
+```yaml
+ai_models:
+  base_path: E:/AI/Models/QwenImage21
+  diffusion_models: diffusion_models
+  text_encoders: text_encoders
+  vae: vae
+
+sdxl:
+  base_path: E:/AI/Models/Image
+  checkpoints: Stable-diffusion
+  loras: Lora
+  vae: VAE
+  controlnet: ControlNet
+  upscale_models: Upscale
+```
+
+**好处**：ComfyUI 可以随时 `git pull` 或整个删掉重装，权重一个字节都不用动。
+项目级的 `--extra-model-paths-config` 再叠加在这个全局配置之上。
 
 ---
 
@@ -442,7 +515,151 @@ venv\Scripts\python.exe main.py ^
 
 ---
 
-## 7. 故障速查表
+## 7. SDXL 文生图（ComfyUI / ForgeNeo 双前端）
+
+**和上面两个大模型形成对照：SDXL 在 RDNA4 上不需要任何 workaround。**
+这是判断"某个报错是 RDNA4 的锅、还是这个模型自己的锅"的基准线。
+
+模型：`RealVisXL_V5.0_fp16.safetensors`（6.9 GiB，SDXL 架构）
+
+### 7.1 ComfyUI 路线
+
+启动参数干净得多 —— **没有** RDNA4 环境变量，**没有** `--disable-pinned-memory`，
+**没有** `--use-pytorch-cross-attention`：
+
+```bat
+venv\Scripts\python.exe main.py ^
+  --listen 127.0.0.1 --port 8188 --disable-api-nodes ^
+  --output-directory E:\AI\Data\Images\SDXL ^
+  --temp-directory E:\AI\Temp\ComfyUI ^
+  --user-directory E:\AI\Data\ComfyUI ^
+  --auto-launch
+```
+
+模型走 §4.3 里 `extra_model_paths.yaml` 的 `sdxl` 段，不用复制进 ComfyUI 目录。
+
+### 7.2 ForgeNeo 路线（同一份权重）
+
+`COMMANDLINE_ARGS` **留空**即可，默认参数在 RDNA4 上直接能跑：
+
+```bat
+set COMMANDLINE_ARGS=
+:: 下面这些都试过，SDXL 场景不需要，注释掉备查
+:: --xformers --sage --uv
+:: --pin-shared-memory --cuda-malloc --cuda-stream
+call webui.bat
+```
+
+`config.json` 只改输出目录，让两个前端的产物都落到同一个数据盘：
+
+```json
+{
+  "outdir_txt2img_samples": "E:\\AI\\Data\\Images\\txt2img",
+  "outdir_img2img_samples": "E:\\AI\\Data\\Images\\img2img",
+  "outdir_txt2img_grids":   "E:\\AI\\Data\\Images\\grids",
+  "outdir_img2img_grids":   "E:\\AI\\Data\\Images\\grids",
+  "outdir_extras_samples":  "E:\\AI\\Data\\Images\\extras",
+  "samples_save": true
+}
+```
+
+> **推论（可直接用于排障）**：如果用户在 RDNA4 上跑 SDXL 遇到问题，
+> **先不要往 ROCm workaround 的方向查** —— SDXL 这条路是干净的，
+> 问题更可能在模型文件、VAE 或前端配置上。反过来，Qwen-Image 2.1 / H3 出问题，
+> 优先查 §9 那张表。
+
+---
+
+## 8. 对话前端
+
+两个前端都是纯本地回环，不对外暴露。
+
+### 8.1 Open WebUI（接 Ollama，端口 8080）
+
+```bat
+set "DATA_DIR=%ROOT%data"
+set "OLLAMA_BASE_URL=http://127.0.0.1:11434"
+set "ENABLE_OPENAI_API=False"     rem 不连外部 API，纯本地
+set "WEBUI_AUTH=False"            rem 仅因为只监听 127.0.0.1
+set "HF_ENDPOINT=https://hf-mirror.com"   rem 国内镜像，拉 embedding 模型用
+set "PYTHONUTF8=1"
+
+venv\Scripts\open-webui.exe serve --host 127.0.0.1 --port 8080
+```
+
+⚠️ **`WEBUI_AUTH=False` 只在严格回环监听时才可接受。**
+一旦把 `--host` 改成 `0.0.0.0` 或做端口转发，必须先把它改回 `True`，
+否则局域网内任何人都能直接用你的模型。
+
+启动脚本做了三件有用的事：
+
+**① 先清场再启动**，并且**读 Windows 性能计数器把实际显存占用打出来**
+（Windows 上没有 `nvidia-smi`，这是个实用替代）：
+
+```powershell
+$v = (Get-Counter '\GPU Adapter Memory(*)\Dedicated Usage').CounterSamples |
+     ? CookedValue -gt 0 | select -First 1
+'VRAM in use: {0:N2} GB' -f ($v.CookedValue/1GB)
+```
+
+**② Ollama 没跑就拉起来**，不重复启动：
+
+```bat
+tasklist /FI "IMAGENAME eq ollama.exe" | find /I "ollama.exe" >nul ^
+  || start "" /B "E:\AI\Apps\Ollama\ollama.exe" serve
+```
+
+**③ 轮询 `/health` 就绪后才开浏览器**，避免开出一个报错页：
+
+```powershell
+for($i=0;$i -lt 120;$i++){
+  try{ Invoke-WebRequest http://127.0.0.1:8080/health -UseBasicParsing -TimeoutSec 2 | Out-Null
+       Start-Process http://127.0.0.1:8080; break }
+  catch{ Start-Sleep 2 }
+}
+```
+
+### 8.2 SillyTavern（接 llama.cpp 的 OpenAI 兼容端点，端口 8000）
+
+Node.js 应用，接 §3.2 那两个 `llama-server` 暴露的 OpenAI 兼容 API（`:8081`）。
+
+`config.yaml` 关键项：
+
+```yaml
+port: 8000
+listen: true             # 配合 whitelistMode 使用
+whitelistMode: true      # ✅ 只有白名单 IP 能连，这是主要防线
+basicAuthMode: false
+securityOverride: false  # ✅ 保持 false，它会绕过白名单检查
+enableCorsProxy: false
+dataRoot: ./data
+```
+
+> **`listen: true` + `whitelistMode: true` 是安全的组合**；
+> 把 `whitelistMode` 关掉或把 `securityOverride` 打开，就等于把角色卡和对话历史
+> 开放给整个局域网。改这两项前务必想清楚。
+
+启动：`Start.bat`（先 `npm install --omit=dev --ignore-scripts` 再 `node server.js`）。
+
+### 8.3 端口总表
+
+| 端口 | 服务 | 监听 |
+|---|---|---|
+| 11434 | Ollama API | 127.0.0.1 |
+| 8081 | llama.cpp `llama-server`（OpenAI 兼容） | 0.0.0.0 ⚠️ |
+| 8080 | Open WebUI | 127.0.0.1 |
+| 8000 | SillyTavern | 白名单模式 |
+| 8188 | ComfyUI 主生图 / SDXL | 127.0.0.1 |
+| 8190 | ComfyUI Qwen 2.1 A-B 测试 | 127.0.0.1 |
+| 8192 | ComfyUI MiniMax H3 视频 | 127.0.0.1 |
+| 7860 | ForgeNeo（默认） | 127.0.0.1 |
+
+⚠️ `llama-server` 用的是 `--host 0.0.0.0`，**局域网可达且无鉴权**。
+如果不需要从别的设备连，改成 `--host 127.0.0.1`。
+
+---
+
+## 9. 故障速查表
 
 按现象检索。**这些全部是实测遇到并解决的，不是推测。**
 
@@ -459,10 +676,13 @@ venv\Scripts\python.exe main.py ^
 | 第二个 ComfyUI 起不来 / 两个都崩 | 16 GB 装不下两份 | 启动脚本加 §5.5 端口检查 |
 | Ollama 和 llama.cpp 互相抢显存 | 无互斥 | 启动前跑 §3.3 的清场脚本 |
 | 跑分不可复现 | 从 `resolve/main/` 下的权重漂移了 | 固定到 `resolve/<commit>/` |
+| SDXL 加了 RDNA4 参数没变化 | SDXL 本来就不需要那套（§4.2） | 去掉，从模型/VAE/前端配置方向查 |
+| Open WebUI 打开就是报错页 | 服务还没就绪就开了浏览器 | 轮询 `/health` 就绪后再开（§8.1） |
+| Windows 上想看显存占用但没有 nvidia-smi | AMD 卡无此工具 | 读性能计数器 `\GPU Adapter Memory(*)\Dedicated Usage`（§8.1） |
 
 ---
 
-## 8. 已证伪清单
+## 10. 已证伪清单
 
 **看起来该开、实测必须关的选项。给建议前先看这里。**
 
@@ -475,19 +695,36 @@ venv\Scripts\python.exe main.py ^
 | Ollama 走 ROCm | ⚠️ 当时不支持 | RDNA4 不在支持列表，**Vulkan 反而稳**，34/34 层全卸载 |
 | 1024×1024 以上不加 offload | ❌ 撞墙 | 峰值已达 15.9 GiB = 物理上限 |
 | 两份 ComfyUI 共存 | ❌ 不可能 | 16 GB 不够 |
+| 给 SDXL 套 RDNA4 workaround | ⚠️ **没必要** | 默认参数即可跑通，加了是白搭（§7） |
+| ForgeNeo 的 `--xformers` / `--cuda-malloc` 等 | ⚠️ 未采用 | `COMMANDLINE_ARGS` 留空就能跑，无需这些 |
 
 ---
 
-## 9. 目录布局参考
+## 11. 目录布局参考
 
 ```
-E:\AI\Apps      ComfyUI / ForgeNeo / Ollama / llama.cpp-rocm / OpenWebUI / SillyTavern
-E:\AI\Models    gguf/ Image/ Ollama/ QwenImage21/
-E:\AI\Cache     huggingface/ miopen/ pip/ torch/     ← 全部离盘，系统盘不落缓存
-E:\AI\Projects  每个模型一个子目录：workflow + benchmark + environment-audit
+E:\AI\Apps
+   ComfyUI/          三个实例共用一份代码，靠 --port / --extra-model-paths-config 区分
+   ForgeNeo/         SDXL 第二前端，与 ComfyUI 共用同一份权重
+   Ollama/           便携版 + 自定义 Modelfile
+   llama.cpp-rocm/   gfx120X 预编译包，自带 HIP 运行时
+   OpenWebUI/        venv + data
+   SillyTavern/      Node.js
+E:\AI\Models
+   gguf/             llama.cpp 用的对话模型
+   Image/            SDXL: Stable-diffusion/ Lora/ VAE/ ControlNet/ Upscale/
+   Ollama/           blobs/ manifests/ metadata/
+   QwenImage21/      diffusion_models/ text_encoders/ vae/ loras/
+E:\AI\Cache          huggingface/ miopen/ pip/ torch/   ← 全部离盘，系统盘不落缓存
+E:\AI\Projects       每个模型一个子目录：workflow + benchmark + environment-audit
+E:\AI\Data           Images/ Videos/ ComfyUI/（用户目录）
 E:\AI\Logs
-F:\AI\Models\MiniMaxH3    H3 权重 53 GiB，单独放机械盘
+F:\AI\Models\MiniMaxH3   H3 权重 53 GiB，单独放机械盘
 ```
+
+**ComfyUI 一份代码跑三个实例**（SDXL :8188 / Qwen A-B :8190 / H3 :8192），
+靠三样东西隔离：`--port`、`--temp-directory`、`--extra-model-paths-config`。
+共用 `--user-directory`，所以节点布局和界面设置是共享的。
 
 每个项目目录里固定放三样东西，这是能复现跑分的原因：
 
@@ -499,14 +736,17 @@ F:\AI\Models\MiniMaxH3    H3 权重 53 GiB，单独放机械盘
 
 ## 覆盖范围与边界
 
-**已验证**：上表全部条目，在 §1 基线环境下实测。
+**已验证**：「已部署清单」里的全部条目，在 §1 基线环境下实测。
 
 **未验证 / 不保证**：
 
+- **stable-diffusion.cpp 的 Vulkan 路线** —— 写过对照跑分脚本，但 `sd-cli.exe` 从未实际安装，
+  所以**本文没有 Vulkan vs ROCm 的生图对照数据**。别把 §3.1 的 Ollama Vulkan 结论外推到生图。
 - 其他 RDNA4 型号（9070 非 XT、9060 等）—— 显存和 CU 数不同，跑分不适用，环境变量结论大概率仍成立
 - RDNA3（gfx110x）—— 算子能力表需重测
 - Linux ROCm —— triton 可用，本文多处结论（`--use-pytorch-cross-attention`、TunableOp）不适用
 - WSL2 —— 未测
+- 多模型**同时**运行 —— 全部方案都是互斥运行，共驻只在 §6.2 作为失败案例出现
 
 **许可**：本仓库的文档与自研节点代码 MIT。第三方模型权重各自遵循其原始许可，本仓库不再分发。
 
