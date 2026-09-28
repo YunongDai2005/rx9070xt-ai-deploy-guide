@@ -1,20 +1,22 @@
-# 运行日志实录 · RX 9070 XT
+# Run Logs · RX 9070 XT
 
-真实运行日志 + 逐段注解。[← 返回主文档](README.md) · [English](RUNLOGS.en.md)
+Real run logs with annotations. [← Back to main doc](README.md) · [中文](RUNLOGS.zh.md)
 
-这份文件的用途：让你**在自己跑之前就知道正常的日志长什么样**。
-照着主文档部署时，把你的日志和这里对比，偏差在哪一眼就能看出来。
+The purpose of this file: **let you know what a healthy log looks like before you run it
+yourself.** While following the main document, diff your logs against these and any deviation
+becomes obvious immediately.
 
-> **关于"效果"的说明**：本文件只记录**可测量的**指标 —— 耗时、显存、
-> 层数、吞吐、报错。**不包含任何生成内容的画质/观感评价**，因为撰写时
-> 未查看任何输出图像或视频。画质请你自己判断，本文只负责让你知道
-> 什么设置下该花多久、占多少显存。
+> **On "results"**: this file records **measurable** metrics only — wall time, VRAM, layer
+> counts, throughput, errors. It contains **no assessment of the visual quality of generated
+> output**, because no output image or video was viewed while writing it. Judge quality
+> yourself; this document exists to tell you how long a given setting should take and how
+> much VRAM it should use.
 
 ---
 
-## 1. Ollama + Vulkan 加载 Qwen3.5 9B
+## 1. Ollama + Vulkan loading Qwen3.5 9B
 
-### 1.1 设备识别
+### 1.1 Device detection
 
 ```
 "inference compute" id=0 library=Vulkan name=Vulkan0
@@ -25,11 +27,11 @@
 common_param: - Vulkan0 : AMD Radeon RX 9070 XT (16304 MiB, 15437 MiB free)
 ```
 
-✅ **该看到什么**：`library=Vulkan`、`type=discrete`、`15437 MiB free`。
-❌ **如果 `library=ROCm`**：说明你的 Ollama 版本已支持 RDNA4 的 ROCm，
-本文的 Vulkan 结论可能不再适用，速度请自行重测。
+✅ **What you should see**: `library=Vulkan`, `type=discrete`, `15437 MiB free`.
+❌ **If you see `library=ROCm`**: your Ollama build now supports ROCm on RDNA4, so this
+document's Vulkan conclusions may no longer apply — re-measure throughput yourself.
 
-### 1.2 层卸载 —— 最关键的三行
+### 1.2 Layer offload — the three lines that matter most
 
 ```
 load_tensors: offloaded 34/34 layers to GPU
@@ -39,19 +41,21 @@ load_tensors:      Vulkan0 model buffer size =  4717.38 MiB
 load_tensors:  Vulkan_Host model buffer size =   545.63 MiB
 ```
 
-✅ **`34/34` 是成功标志。** 分母是模型总层数，两个数字必须相等。
-❌ **如果是 `28/34` 之类**：有层留在 CPU 上，速度会掉到个位数 tok/s。
-原因通常是显存被别的进程占了 —— 先跑主文档 §3.3 的清场脚本。
+✅ **`34/34` is the success marker.** The denominator is the model's total layer count; the
+two numbers must match.
+❌ **If you see something like `28/34`**: layers are stuck on CPU and throughput will collapse
+to single-digit tok/s. Usually another process is holding VRAM — run the teardown script from
+main doc §3.3 first.
 
-显存分配明细：
+VRAM allocation breakdown:
 
 ```
 common_memory_breakdown_print:
   Vulkan0 (RX 9070 XT) | 16304 = 15386 + (5231 = 4717 + 306 + 208) + -4314
-                         总量    可用    合计   权重  KV   其他
+                         total   usable  sum   weights KV  other
 ```
 
-### 1.3 上下文：一个容易被忽略的余量
+### 1.3 Context: headroom that's easy to miss
 
 ```
 print_info: n_ctx_train           = 262144
@@ -59,40 +63,42 @@ print_info: n_ctx_orig_yarn       = 262144
 OLLAMA_CONTEXT_LENGTH:8192
 ```
 
-> **Qwen3.5 9B 原生支持 256K 上下文，本部署只开了 8192。**
-> 不是模型的限制，是 16 GB 显存的取舍 —— 权重已占 4.7 GB，
-> 上下文拉长 KV cache 会线性膨胀。
-> **想要长上下文：要么降量化，要么按主文档 §3.2 换 llama.cpp 走量化 KV cache。**
+> **Qwen3.5 9B natively supports 256K context; this deployment runs 8192.**
+> That is not a model limit, it is a 16 GB trade-off — weights already take 4.7 GB, and KV
+> cache grows linearly with context.
+> **If you want long context**: either drop the quantization, or switch to llama.cpp with a
+> quantized KV cache as in main doc §3.2.
 
-其他值得注意的默认值：
+Other defaults worth noting:
 
 ```
-OLLAMA_FLASH_ATTENTION:false    ← Vulkan 后端未启用
-OLLAMA_NUM_PARALLEL:1           ← 单并发，16 GB 卡上合理
-OLLAMA_KEEP_ALIVE:5m0s          ← 5 分钟无请求自动卸载，释放显存给游戏
-tokenizer.ggml.tokens arr[str,248320]   ← 词表 248320
+OLLAMA_FLASH_ATTENTION:false    <- not enabled on the Vulkan backend
+OLLAMA_NUM_PARALLEL:1           <- single concurrency, sensible on a 16 GB card
+OLLAMA_KEEP_ALIVE:5m0s          <- auto-unload after 5 idle minutes, frees VRAM for games
+tokenizer.ggml.tokens arr[str,248320]   <- 248320-token vocabulary
 ```
 
-### 1.4 实测吞吐
+### 1.4 Measured throughput
 
-| 指标 | 数值 |
+| Metric | Value |
 |---|---|
-| 生成 | **~24 tok/s** |
-| 提示处理 | 250–340 tok/s |
-| 冷启动加载 | ~十几秒 |
-| 权重显存 | 4717.38 MiB |
-| 主机端 | 545.63 MiB |
+| Generation | **~24 tok/s** |
+| Prompt processing | 250–340 tok/s |
+| Cold start | ~15 s |
+| Weight VRAM | 4717.38 MiB |
+| Host side | 545.63 MiB |
 
-**24 tok/s 大致是什么体验**：比人的阅读速度快，交互上没有等待感。
-作为对照，同卡走 llama.cpp ROCm 的 27B Q3_K 会明显慢于此 —— 参数量翻了 3 倍。
+**What 24 tok/s feels like**: faster than human reading speed — no perceptible wait in
+interactive use. For contrast, the 27B Q3_K on the same card via llama.cpp ROCm is noticeably
+slower; it has 3× the parameters.
 
 ---
 
-## 2. Qwen-Image 2.1 A/B 跑分
+## 2. Qwen-Image 2.1 A/B benchmark
 
-完整数据见主文档 §5.2，这里给日志侧的观察。
+Full numbers are in main doc §5.2; here are the log-side observations.
 
-### 2.1 权重校验（跑分前必做）
+### 2.1 Weight verification (do this before benchmarking)
 
 ```json
 [
@@ -111,51 +117,52 @@ tokenizer.ggml.tokens arr[str,248320]   ← 词表 248320
 ]
 ```
 
-> **`ok: true` 全绿再跑分。** 下载中断导致的截断文件能加载成功但出图异常，
-> 这种问题不查 hash 会浪费很多时间。
+> **Wait for all `ok: true` before benchmarking.** A file truncated by an interrupted download
+> will still load successfully but produce broken images — a failure mode that wastes a lot of
+> time if you don't check hashes.
 
-### 2.2 显存监控采样（方案 B, int8_convrot）
+### 2.2 VRAM sampling curve (route B, int8_convrot)
 
-跑分脚本每 30 秒采一次峰值分配，这是完整曲线：
+The benchmark script samples peak allocation every 30 seconds. Full curve:
 
 ```
- 29 s   peak allocated  0.000 GiB   ← 还在读盘
+ 29 s   peak allocated  0.000 GiB   <- still reading from disk
  59 s   peak allocated  0.000 GiB
- 97 s   peak allocated  5.182 GiB   ← 权重开始上卡
+ 97 s   peak allocated  5.182 GiB   <- weights start landing on the GPU
 127 s   peak allocated  5.460 GiB
 157 s   peak allocated  5.739 GiB
 187 s   peak allocated  6.047 GiB
 217 s   peak allocated  7.056 GiB
-247 s   peak allocated 12.109 GiB   ← 采样开始，显存跳升
+247 s   peak allocated 12.109 GiB   <- sampling begins, VRAM jumps
 277 s   peak allocated 13.707 GiB
-307 s   peak allocated 13.707 GiB   ← 平台期
+307 s   peak allocated 13.707 GiB   <- plateau
 337 s   peak allocated 13.707 GiB
 FINISHED 363.88 s
 ```
 
-**两个可以直接拿来对照的特征：**
+**Two features you can compare against directly:**
 
-1. **前 90 秒显存是 0** —— 全在读盘。看到这里别以为卡住了。
-2. **247 s 处从 7 GB 跳到 12 GB** —— 采样阶段的激增。
-   如果你的卡在这一步 OOM，说明前面留的余量不够。
+1. **VRAM is 0 for the first 90 seconds** — that is all disk read. Don't assume it's hung.
+2. **At 247 s it jumps from 7 GB to 12 GB** — the sampling-phase spike. If your card OOMs
+   at this step, you didn't leave enough headroom earlier.
 
-### 2.3 A/B 最终结果
+### 2.3 Final A/B result
 
-| | 冷跑 | 热跑 | 稳态显存 | 跑完剩余 |
+| | Cold | Warm | Resident VRAM | Free after |
 |---|---|---|---|---|
 | A · Q8_0 GGUF | 294.7 s | **40.4 s** | 14.03 GB | 2.38 GB |
 | B · int8_convrot | 155.9 s | **97.4 s** | 6.02 GB | 10.49 GB |
 
-**热跑差 2.4 倍，显存差 2.3 倍 —— 这是一组干净的反向权衡。**
-1024×1024 / 20 步 / cfg 6.0 / euler。
+**2.4× apart on warm time, 2.3× apart on VRAM — a clean inverse trade-off.**
+1024×1024 / 20 steps / cfg 6.0 / euler.
 
 ---
 
-## 3. MiniMax H3 文生视频 · 完整运行
+## 3. MiniMax H3 text-to-video · full run
 
-唯一一次完整成功的运行，**277.87 秒 / 10 步**。
+The one fully successful run: **277.87 seconds / 10 steps**.
 
-### 3.1 启动阶段
+### 3.1 Startup
 
 ```
 Total VRAM 16304 MB, total RAM 32683 MB
@@ -169,10 +176,10 @@ Found comfy_kitchen backend hip: {'available': True, 'disabled': False, ...}
     0.1 seconds: custom_nodes\ComfyUI-GGUF
 ```
 
-✅ 三个自研节点必须出现在这个列表里，否则补丁没生效。
-✅ `triton` 报 ImportError 是**正常的** —— Windows ROCm 没有 triton wheel。
+✅ All three custom nodes must appear in this list, or the patches didn't take effect.
+✅ The `triton` ImportError is **expected** — there is no triton wheel for Windows ROCm.
 
-### 3.2 mmap 补丁生效
+### 3.2 The mmap patch firing
 
 ```
 [H3-VRAM-Gate] mmap loading qwen3vl_32b_minimax_h3_int8_convrot.safetensors
@@ -186,14 +193,15 @@ model weight dtype torch.bfloat16, manual cast: torch.bfloat16
 model_type FLOW_AV
 ```
 
-> **`mmap loading` 出现两次才对** —— 25.3 GiB 的编码器和 19.5 GiB 的扩散模型
-> 都超过 16 GiB 阈值。**如果一次都没出现，说明补丁没装上，进程会直接被
-> `0xC0000005` 杀掉**（详见主文档 §6.1）。
+> **`mmap loading` should appear twice** — both the 25.3 GiB encoder and the 19.5 GiB
+> diffusion model exceed the 16 GiB threshold. **If it never appears, the patch isn't
+> installed and the process will be killed outright by `0xC0000005`** (see main doc §6.1).
 
-**`Native ops` / `emulated ops` 这两行是判断量化格式是否真被加速的唯一依据。**
-`nvfp4` 和 `mxfp8` 在 emulated 一侧 —— 能跑，但没有硬件加速。
+**The `Native ops` / `emulated ops` pair is the only reliable way to tell whether a
+quantization format is actually accelerated.** `nvfp4` and `mxfp8` sit on the emulated side —
+they run, but without hardware acceleration.
 
-### 3.3 模型加载：部分加载但未降级
+### 3.3 Model loading: partial, but not degraded
 
 ```
 Requested to load MiniMaxH3TEModel_
@@ -207,23 +215,24 @@ loaded partially; 13866.61 MB usable, 13386.64 MB loaded,
                   lowvram patches: 0
 ```
 
-> ⭐ **`lowvram patches: 0` 是整份日志里最该 grep 的一行。**
-> 模型被拆开（合计约 19 GB 卸到 CPU）是正常且必要的，
-> **但 `lowvram patches` 一旦非 0，就说明落进了 ComfyUI 的降级路径，速度会断崖下跌。**
-> 部分加载 ≠ 降级，这两件事经常被搞混。
+> ⭐ **`lowvram patches: 0` is the single most important line to grep in the whole log.**
+> Models being split (about 19 GB offloaded to CPU in total) is normal and necessary.
+> **But the moment `lowvram patches` is non-zero, you have fallen into ComfyUI's degradation
+> path and throughput drops off a cliff.** Partial loading ≠ degradation — these two are
+> frequently confused.
 
-同时可以看到 AOTriton 注意力后端确实启用了：
+The AOTriton attention backend is confirmed active:
 
 ```
 UserWarning: Using AOTriton backend for Efficient Attention forward...
 (aten/src/ATen/native/transformers/hip/attention.hip:1452)
 ```
 
-### 3.4 采样：首步慢 3.4 倍是正常的
+### 3.4 Sampling: a 3.4× slower first step is normal
 
 ```
   0%|          | 0/10 [00:00<?, ?it/s]
- 10%|█         | 1/10 [00:13<02:00, 13.41s/it]   ← 含 kernel 首次编译
+ 10%|█         | 1/10 [00:13<02:00, 13.41s/it]   <- includes first kernel compile
  20%|██        | 2/10 [00:19<01:10,  8.82s/it]
  30%|███       | 3/10 [00:25<00:54,  7.81s/it]
  40%|████      | 4/10 [00:32<00:43,  7.30s/it]
@@ -232,16 +241,16 @@ UserWarning: Using AOTriton backend for Efficient Attention forward...
  70%|███████   | 7/10 [00:44<00:15,  5.00s/it]
  80%|████████  | 8/10 [00:48<00:08,  4.45s/it]
  90%|█████████ | 9/10 [00:51<00:04,  4.14s/it]
-100%|██████████| 10/10 [00:55<00:00,  3.98s/it]  ← 收敛值
-100%|██████████| 10/10 [00:55<00:00,  5.52s/it]  ← 平均值
+100%|██████████| 10/10 [00:55<00:00,  3.98s/it]  <- converged
+100%|██████████| 10/10 [00:55<00:00,  5.52s/it]  <- average
 ```
 
-> **首步 13.41 s，末步 3.98 s。** 首步包含 MIOpen kernel 选择和 AOTriton
-> 注意力内核编译。**评估这张卡必须用收敛值 3.98 s/it，用平均值 5.52 s/it
-> 会低估 39%。** 如果你的首步耗时远超 13 s，检查 MIOpen 缓存目录是否可写
-> （主文档 §4.1 的 `MIOPEN_USER_DB_PATH`）。
+> **First step 13.41 s, last step 3.98 s.** The first includes MIOpen kernel selection and the
+> AOTriton attention kernel compile. **Evaluate this card on the converged 3.98 s/it; the
+> 5.52 s/it average understates it by 39%.** If your first step takes far more than 13 s,
+> check that the MIOpen cache directory is writable (`MIOPEN_USER_DB_PATH`, main doc §4.1).
 
-### 3.5 解码阶段
+### 3.5 Decode stage
 
 ```
 [H3-VRAM-Gate] free VRAM 15359 -> 15357 MB
@@ -252,24 +261,25 @@ loaded completely; 12827.35 MB usable, 4966.19 MB loaded, full load: True
 Prompt executed in 277.87 seconds
 ```
 
-⚠️ **诚实标注**：门控节点只释放了 2 MB（15359 → 15357），
-说明采样结束时 ComfyUI 已经自己清干净了。**这条日志不能证明门控"救了"这次运行** ——
-它的价值是保证时序确定，不依赖 ComfyUI 恰好做对。
+⚠️ **Honest caveat**: the gate node freed only 2 MB (15359 → 15357), meaning ComfyUI had
+already cleared everything by the end of sampling. **This log does not prove the gate "saved"
+the run** — its value is guaranteeing deterministic ordering rather than relying on ComfyUI
+happening to get it right.
 
-### 3.6 时间去向
+### 3.6 Where the time goes
 
-| 阶段 | 耗时 | 占比 |
+| Stage | Time | Share |
 |---|---|---|
-| 模型加载 + 文本编码 | ~215 s | **77%** |
-| 采样（10 步） | 55 s | 20% |
-| 双 VAE 解码 | ~8 s | 3% |
-| **合计** | **277.87 s** | |
+| Model load + text encode | ~215 s | **77%** |
+| Sampling (10 steps) | 55 s | 20% |
+| Dual VAE decode | ~8 s | 3% |
+| **Total** | **277.87 s** | |
 
-> **瓶颈是读盘，不是算力。** 日志里 `fast_disk=False` 就是慢盘标志 ——
-> 本机 H3 的 53 GiB 权重在机械盘上。**换 SSD 是唯一有意义的优化方向，
-> 调采样器参数改不了那 77%。**
+> **The bottleneck is disk, not compute.** `fast_disk=False` in the log is the slow-disk flag
+> — H3's 53 GiB of weights live on a mechanical drive here. **Moving to an SSD is the only
+> meaningful optimization; no sampler setting touches that 77%.**
 
-### 3.7 失败记录：音频分支
+### 3.7 Failure record: the audio branch
 
 ```
 Prompt executed in 148.23 seconds
@@ -277,17 +287,17 @@ Prompt executed in 148.23 seconds
 AttributeError: 'ModelSamplingAdvanced' object has no attribute 'audio_scale'
 ```
 
-`model_type` 是 `FLOW_AV`（音视频联合），采样节点必须携带 `audio_scale` 属性。
-**视频分支完整可用，音频分支未跑通。**
-这个报错**与 RDNA4 无关，NVIDIA 上同样复现** —— 是节点选择问题。
+`model_type` is `FLOW_AV` (joint audio-video), so the sampling node must carry an
+`audio_scale` attribute. **The video branch works completely; the audio branch does not.**
+This error is **unrelated to RDNA4 and reproduces on NVIDIA** — it is a node selection issue.
 
 ---
 
-## 4. 安装阶段日志
+## 4. Installation logs
 
-装环境时最容易卡住的几处，都有日志佐证。
+The places most likely to stall during setup, each backed by a log.
 
-### 4.1 ROCm SDK 不在 PyPI 上
+### 4.1 The ROCm SDK is not on PyPI
 
 ```
 Collecting rocm-sdk-core==7.2.1
@@ -295,121 +305,125 @@ Collecting rocm-sdk-core==7.2.1
              rocm_sdk_core-7.2.1-py3-none-win_amd64.whl (644.8 MB)
 ```
 
-> **Windows 的 ROCm SDK 来自 `repo.radeon.com`，不是 PyPI。** 单个 wheel 644.8 MB。
-> 本机这次下载中途因网络读取错误失败过（日志里是 urllib3 的 `_error_catcher` 栈）。
-> **准备好断点重试** —— 644 MB 一次拉完在不稳定的线路上不现实。
+> **The Windows ROCm SDK comes from `repo.radeon.com`, not PyPI.** A single 644.8 MB wheel.
+> On this machine the download failed partway through with a network read error (the log shows
+> an urllib3 `_error_catcher` traceback).
+> **Be ready to resume** — pulling 644 MB in one shot is unrealistic on an unstable link.
 
-### 4.2 镜像加速与跳过 490 MB 无用素材
-
-```
-=== 1. 生成过滤后的依赖清单 ===
-  已剔除: comfyui-workflow-templates==0.11.66
-  写入: requirements-nomedia.txt
-
-=== 2. 模板包（只装本体和 JSON，跳过 ~490MB 预览素材） ===
->>> templates 本体 (--no-deps)  [1]  mirror.nju.edu.cn   OK
->>> templates core + json      [1]  mirror.nju.edu.cn   OK
-=== 3. 安装 ComfyUI 其余依赖 ===
->>> ComfyUI requirements (过滤后) [1] mirror.nju.edu.cn  OK
-=== 4. 安装 ComfyUI-GGUF 依赖 ===
->>> GGUF requirements          [1]  mirror.nju.edu.cn   OK
-```
-
-**两个实用技巧：**
-
-1. **`comfyui-workflow-templates` 带约 490 MB 预览缩略图素材。**
-   用 `--no-deps` 只装本体 + JSON，省 490 MB。
-   代价：模板浏览器里缩略图是空的，**不影响出图**，本地工作流文件照常加载。
-2. **pip 走国内镜像**（本机用 `mirror.nju.edu.cn`），否则 torch ROCm 那几个
-   大 wheel 基本拉不动。
-
-### 4.3 安装完成的验证输出
+### 4.2 Mirrors, and skipping 490 MB of unused assets
 
 ```
-=== 5. 验证 ===
+=== 1. build a filtered requirements list ===
+  excluded: comfyui-workflow-templates==0.11.66
+  written:  requirements-nomedia.txt
+
+=== 2. template package (body + JSON only, skipping ~490MB of preview assets) ===
+>>> templates body (--no-deps)  [1]  mirror.nju.edu.cn   OK
+>>> templates core + json       [1]  mirror.nju.edu.cn   OK
+=== 3. remaining ComfyUI dependencies ===
+>>> ComfyUI requirements (filtered) [1] mirror.nju.edu.cn OK
+=== 4. ComfyUI-GGUF dependencies ===
+>>> GGUF requirements           [1]  mirror.nju.edu.cn   OK
+```
+
+**Two practical tricks:**
+
+1. **`comfyui-workflow-templates` ships roughly 490 MB of preview thumbnails.**
+   Install body + JSON only with `--no-deps` and save all 490 MB.
+   Cost: empty thumbnails in the template browser. **Generation is unaffected** and local
+   workflow files load normally.
+2. **Route pip through a regional mirror** (`mirror.nju.edu.cn` here), or the large torch ROCm
+   wheels are effectively undownloadable.
+
+### 4.3 Post-install verification output
+
+```
+=== 5. verification ===
 torch 2.9.1+rocm7.2.1
 gpu_available True
 device AMD Radeon RX 9070 XT
 imports_ok True
 ```
 
-✅ **这四行全对才算装好。** `gpu_available False` 最常见的原因是
-装了 CPU 版 torch 覆盖掉了 ROCm 版 —— 检查 `torch.__version__`
-末尾有没有 `+rocm7.2.1` 后缀。
+✅ **All four lines must be correct.** The most common cause of `gpu_available False` is a
+CPU-only torch overwriting the ROCm build — check that `torch.__version__` still ends in
+`+rocm7.2.1`.
 
 ---
 
-## 5. 效果预期表
+## 5. What to expect
 
-**什么设置 → 该花多久、占多少显存。** 用于开跑前对表，不是画质评价。
+**Given a setting → how long it should take and how much VRAM it should use.**
+For pre-run comparison, not a quality judgment.
 
-### 5.1 对话
+### 5.1 Chat
 
-| 模型 | 上下文 | 显存 | 速度 | 体验 |
+| Model | Context | VRAM | Speed | Feel |
 |---|---|---|---|---|
-| Qwen3.5 9B Q4 | 8K | 4.7 GB | 24 tok/s | 交互无等待感 |
-| 27B Q3_K | 16K（KV q4_0） | ~12.6 GB + KV | 明显慢于 9B | 参数量 3 倍的代价 |
-| 12B Q6_K | 32K（KV q8_0） | ~9.4 GB + KV | 介于两者之间 | 长上下文 + 较高量化质量 |
+| Qwen3.5 9B Q4 | 8K | 4.7 GB | 24 tok/s | No perceptible wait |
+| 27B Q3_K | 16K (KV q4_0) | ~12.6 GB + KV | Clearly slower than 9B | The price of 3× parameters |
+| 12B Q6_K | 32K (KV q8_0) | ~9.4 GB + KV | Between the two | Long context at higher quant quality |
 
-### 5.2 文生图
+### 5.2 Text-to-image
 
-| 路线 | 分辨率 | 步数 | 热跑耗时 | 稳态显存 | 能否同时干别的 |
+| Route | Resolution | Steps | Warm time | Resident VRAM | Room for anything else |
 |---|---|---|---|---|---|
-| Qwen-Image 2.1 · Q8_0 | 1024² | 20 | **40 s** | 14.0 GB | ❌ 卡满 |
-| Qwen-Image 2.1 · int8 | 1024² | 20 | **97 s** | 6.0 GB | ✅ 余 10.5 GB |
-| + Pruna 8 步 LoRA | 1024² | 8 | 未单独计时 | 同上 | 步数降 60% |
-| SDXL RealVisXL V5.0 | 1024² | — | 未计时 | ~7 GB | 默认参数即可 |
+| Qwen-Image 2.1 · Q8_0 | 1024² | 20 | **40 s** | 14.0 GB | ❌ card is full |
+| Qwen-Image 2.1 · int8 | 1024² | 20 | **97 s** | 6.0 GB | ✅ 10.5 GB left |
+| + Pruna 8-step LoRA | 1024² | 8 | not timed separately | same | 60% fewer steps |
+| SDXL RealVisXL V5.0 | 1024² | — | not timed | ~7 GB | defaults are fine |
 
-⚠️ **1024×1024 是 16 GB 上不加 offload 的天花板** ——
-两条 Qwen-Image 路线的峰值分配都顶到 ~15.9 GiB，即物理上限。
-想上更高分辨率必须先谈 offload 或降分辨率。
+⚠️ **1024×1024 is the ceiling on 16 GB without offload** — both Qwen-Image routes peak at
+~15.9 GiB, the physical limit. Higher resolutions require discussing offload or scaling down
+first.
 
-### 5.3 文生视频
+### 5.3 Text-to-video
 
-| 项 | 数值 |
+| Item | Value |
 |---|---|
-| 步数 | 10 |
-| 总耗时 | **277.87 s**（约 4 分 38 秒） |
-| 采样收敛速度 | 3.98 s/it |
-| 权重总量 | 53 GiB（需外挂大容量盘） |
-| 峰值上卡 | 13.4 GB（另有约 19 GB 卸到 CPU） |
-| 系统内存要求 | 32 GB 勉强够（靠 mmap 只读映射不计 commit charge） |
-| 音频分支 | ⚠️ 未跑通（§3.7） |
+| Steps | 10 |
+| Total time | **277.87 s** (~4 min 38 s) |
+| Converged sampling speed | 3.98 s/it |
+| Total weights | 53 GiB (needs a separate large drive) |
+| Peak on GPU | 13.4 GB (plus ~19 GB offloaded to CPU) |
+| System RAM requirement | 32 GB is just barely enough (read-only mmap avoids commit charge) |
+| Audio branch | ⚠️ not working (§3.7) |
 
-> **H3 在这张卡上是"能跑"而不是"好用"** —— 单条 10 步视频接近 5 分钟，
-> 其中 77% 在读盘。权重放 SSD 能显著改善，但 53 GiB 的占用是硬门槛。
+> **H3 on this card is "runnable", not "pleasant"** — a single 10-step video takes close to
+> 5 minutes, 77% of it disk read. Putting the weights on an SSD helps substantially, but the
+> 53 GiB footprint is a hard requirement.
 
 ---
 
-## 6. 快速自检清单
+## 6. Quick self-check
 
-照主文档部署后，按顺序 grep 你自己的日志：
+After following the main doc, grep your own logs in this order:
 
 ```bash
-# 1. torch 是 ROCm 版
-python -c "import torch;print(torch.__version__)"      # 必须含 +rocm
+# 1. torch is the ROCm build
+python -c "import torch;print(torch.__version__)"      # must contain +rocm
 
-# 2. 认到卡
+# 2. the card is detected
 python -c "import torch;print(torch.cuda.get_device_properties(0).gcnArchName)"   # gfx1201
 
-# 3. Ollama 全层上卡
-grep "offloaded" server.log                            # 必须 N/N
+# 3. Ollama offloaded every layer
+grep "offloaded" server.log                            # must be N/N
 
-# 4. 自研节点已加载
-grep "custom_nodes" comfyui.log                         # 三个节点都在
+# 4. custom nodes loaded
+grep "custom_nodes" comfyui.log                         # all three present
 
-# 5. H3 的 mmap 补丁生效
-grep "mmap loading" comfyui.log                         # 必须出现 2 次
+# 5. the H3 mmap patch fired
+grep "mmap loading" comfyui.log                         # must appear twice
 
-# 6. 没有落进降级路径
-grep "lowvram patches" comfyui.log                      # 必须全是 0
+# 6. no degradation path
+grep "lowvram patches" comfyui.log                      # must all be 0
 
-# 7. 权重没被截断
-# 跑主文档提到的 audit_environment.py，看 matches 是否全 true
+# 7. weights aren't truncated
+# run audit_environment.py from the main doc; every `matches` should be true
 ```
 
-任何一条不符，去主文档 §9 故障速查表按现象查。
+If any check fails, look the symptom up in main doc §9.
 
 ---
 
-[← 返回主文档](README.md)
+[← Back to main doc](README.md)

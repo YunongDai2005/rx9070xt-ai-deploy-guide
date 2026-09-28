@@ -1,137 +1,153 @@
-# RDNA4 本地 AI 部署参考手册
+# RDNA4 Local AI Deployment Reference
 
-**面向 AI 助手的结构化参考数据** · AMD Radeon RX 9070 XT (gfx1201) · Windows 11 原生 · 16 GB VRAM
+**Structured reference data for AI assistants** · AMD Radeon RX 9070 XT (gfx1201) · Native Windows 11 · 16 GB VRAM
 
-**中文** · [English](README.en.md)
+[中文](README.zh.md) · **English**
 
-📋 **配套文档：[运行日志实录 RUNLOGS.md](RUNLOGS.md)** —— 真实日志逐段注解 +
-效果预期表 + 快速自检清单。**部署前先看一眼正常日志长什么样，比出错后再查快得多。**
+📋 **Companion document: [RUNLOGS.md](RUNLOGS.md)** — real logs annotated section by
+section, an expectations table, and a quick self-check list. **Knowing what a healthy log
+looks like before you deploy is much faster than debugging after it breaks.**
 
 ---
 
-## 这份文档是什么
+## What this document is
 
-一台 RX 9070 XT 上**实测跑通**的完整本地 AI 栈的部署参数、跑分数据和踩坑记录。
-写成这个形式，是为了让 AI 助手在帮人部署 RDNA4 环境时能直接查到可靠答案，
-而不是去猜、或者套用 NVIDIA 的经验。
+Measured deployment parameters, benchmarks and failure notes for a complete local AI stack
+running on a single RX 9070 XT. It is written in this form so that an AI assistant helping
+someone set up an RDNA4 machine can look up a reliable answer instead of guessing, or
+carrying over assumptions from NVIDIA hardware.
 
-### 已部署清单
+### Deployment inventory
 
-单卡 16 GB，全部在同一台机器上跑通（**互斥运行**，不是同时）：
+Single 16 GB card. Everything below runs on the same machine, **mutually exclusive, never concurrently**:
 
-| 类别 | 模型 / 组件 | 后端 | 章节 |
+| Category | Model / component | Backend | Section |
 |---|---|---|---|
-| 对话 | Qwen3.5 9B (Q4, 6.6 GB) | Ollama · **Vulkan** | §3.1 |
-| 对话 | 27B (Q3_K, 12.6 GiB) | llama.cpp · ROCm | §3.2 |
-| 对话 | MN-12B-Mag-Mell-R1 (Q6_K, 9.4 GiB) | llama.cpp · ROCm | §3.2 |
-| 文生图 | Qwen-Image 2.1（int8_convrot / Q8_0 / Q4_K_M） | ComfyUI · PyTorch ROCm | §5 |
-| 文生图 | + Pruna 8 步蒸馏 LoRA | ComfyUI | §5.1 |
-| 文生视频 | MiniMax H3（53 GiB）— 视频 ✅ 277.87 s / 音频 ⚠️ 未通 | ComfyUI · PyTorch ROCm | §6 |
-| 文生图 | RealVisXL V5.0 (SDXL, 6.9 GiB) | ComfyUI **和** ForgeNeo | §7 |
-| 前端 | Open WebUI :8080 | 接 Ollama | §8.1 |
-| 前端 | SillyTavern :8000 | 接 llama.cpp OpenAI 兼容端点 | §8.2 |
+| Chat | Qwen3.5 9B (Q4, 6.6 GB) | Ollama · **Vulkan** | §3.1 |
+| Chat | 27B (Q3_K, 12.6 GiB) | llama.cpp · ROCm | §3.2 |
+| Chat | MN-12B-Mag-Mell-R1 (Q6_K, 9.4 GiB) | llama.cpp · ROCm | §3.2 |
+| Text-to-image | Qwen-Image 2.1 (int8_convrot / Q8_0 / Q4_K_M) | ComfyUI · PyTorch ROCm | §5 |
+| Text-to-image | + Pruna 8-step distillation LoRA | ComfyUI | §5.1 |
+| Text-to-video | MiniMax H3 (53 GiB) — video ✅ 277.87 s / audio ⚠️ not working | ComfyUI · PyTorch ROCm | §6 |
+| Text-to-image | RealVisXL V5.0 (SDXL, 6.9 GiB) | ComfyUI **and** ForgeNeo | §7 |
+| Frontend | Open WebUI :8080 | talks to Ollama | §8.1 |
+| Frontend | SillyTavern :8000 | talks to llama.cpp OpenAI-compatible API | §8.2 |
 
-### Qwen 家族覆盖
+### Qwen family coverage
 
-Qwen 系是这张卡上的主力：**5 个不同模型、11 个权重文件、约 108 GB**，
-横跨对话 / 文生图 / 文生视频三类任务。
+The Qwen family carries most of this card's workload: **5 distinct models, 11 weight files,
+about 108 GB**, spanning chat, text-to-image and text-to-video.
 
-| 模型 | 形态 | 大小 | 担任角色 | 章节 |
+| Model | Form | Size | Role | Section |
 |---|---|---|---|---|
-| Qwen3.5 9B | Q4 | 6.59 GB | 对话（Ollama Vulkan，24 tok/s） | §3.1 |
-| Qwen3.8 27B | Q3_K | 13.50 GB | 对话（llama.cpp ROCm）+ 3 个 Ollama 变体 | §3.2 |
-| Qwen-Image 2.1 | `int8_convrot` | 7.26 GB | 扩散主体 —— 省显存路线（稳态 6 GB） | §5.2 B |
-| Qwen-Image 2.1 | `Q8_0` GGUF | 7.64 GB | 扩散主体 —— 快速路线（热跑 40 s） | §5.2 A |
-| Qwen-Image 2.1 | `Q4_K_M` GGUF | 4.60 GB | 扩散主体 —— 备选 | §5.1 |
-| Qwen-Image 2.1 VAE | bf16 | 0.68 GB | 图像解码 | §5.1 |
-| └ Pruna 8 步蒸馏 LoRA | — | 0.34 GB | 采样步数压缩 | §5.1 |
-| Qwen3-VL 8B | `int8_convrot` | 9.35 GB | 文本编码器 —— **视觉塔来源** | §5.3 |
-| Qwen3-VL 8B Instruct | `Q4_K_M` GGUF | 5.03 GB | 文本编码器 —— 语言塔来源 | §5.3 |
-| **Qwen3-VL 32B** | `int8_convrot` | **27.14 GB** | **H3 的文本编码器，全机最大单文件** | §6 |
-| Qwen3-VL 32B（第二变体） | `int8_convrot` | 26.36 GB | H3 备用编码器 | §6 |
+| Qwen3.5 9B | Q4 | 6.59 GB | Chat (Ollama Vulkan, 24 tok/s) | §3.1 |
+| Qwen3.8 27B | Q3_K | 13.50 GB | Chat (llama.cpp ROCm) + 3 Ollama variants | §3.2 |
+| Qwen-Image 2.1 | `int8_convrot` | 7.26 GB | Diffusion — VRAM-thrifty route (6 GB resident) | §5.2 B |
+| Qwen-Image 2.1 | `Q8_0` GGUF | 7.64 GB | Diffusion — fast route (40 s warm) | §5.2 A |
+| Qwen-Image 2.1 | `Q4_K_M` GGUF | 4.60 GB | Diffusion — fallback | §5.1 |
+| Qwen-Image 2.1 VAE | bf16 | 0.68 GB | Image decode | §5.1 |
+| └ Pruna 8-step distill LoRA | — | 0.34 GB | Step-count reduction | §5.1 |
+| Qwen3-VL 8B | `int8_convrot` | 9.35 GB | Text encoder — **source of the vision tower** | §5.3 |
+| Qwen3-VL 8B Instruct | `Q4_K_M` GGUF | 5.03 GB | Text encoder — source of the language tower | §5.3 |
+| **Qwen3-VL 32B** | `int8_convrot` | **27.14 GB** | **H3's text encoder; largest single file on the machine** | §6 |
+| Qwen3-VL 32B (second variant) | `int8_convrot` | 26.36 GB | H3 alternate encoder | §6 |
 
-三个值得注意的点：
+Three things worth noting:
 
-1. **同一个家族覆盖了全栈。** 对话、文生图的扩散主体、文生视频的文本编码器，
-   全部是 Qwen —— 所以本文档里 RDNA4 上关于 Qwen 系的量化结论（`int8_convrot` 可用、
-   GGUF 可用、`nvfp4`/`mxfp8` 是模拟）适用范围比看起来更广。
-2. **Qwen3-VL 同时扮演两个角色**：既是 VLM，又是扩散模型的文本编码器，
-   而且用了 8B / 32B 两个尺度 —— 8B 给 Qwen-Image 2.1，32B 给 MiniMax H3。
-   §5.3 那个"GGUF 缺视觉塔"的坑就是从这个双重身份来的。
-3. **Qwen-Image 2.1 特意存了三份量化**，就是为了做 §5.2 的 A/B 对照。
-   如果你只想跑不想测，选一份即可，别跟着下三份。
+1. **One family covers the whole stack** — chat, the image diffusion backbone, and the video
+   text encoder are all Qwen. So this document's RDNA4 quantization conclusions for Qwen
+   models (`int8_convrot` works, GGUF works, `nvfp4`/`mxfp8` are emulated) apply more broadly
+   than they might appear.
+2. **Qwen3-VL plays two roles at once**: it is both a VLM and a diffusion text encoder, at two
+   scales — 8B for Qwen-Image 2.1, 32B for MiniMax H3. The "GGUF is missing the vision tower"
+   trap in §5.3 comes directly from that dual role.
+3. **Qwen-Image 2.1 is stored in three quantizations on purpose**, to support the §5.2 A/B
+   comparison. If you only want to run it rather than benchmark it, pick one — don't download
+   all three.
 
-> 表中 27B 与 32B 第二变体的具体微调版本名此处省略，不影响任何技术结论 ——
-> 量化格式、尺寸和显存行为才是决定部署参数的因素。
+> The exact fine-tune names of the 27B and the second 32B variant are omitted here. They do
+> not affect any technical conclusion — quantization format, size and VRAM behavior are what
+> determine the deployment parameters.
 
-**自研 ComfyUI 节点**（源码在 `custom_nodes/`）：
+**Custom ComfyUI nodes** (source in `custom_nodes/`):
 
-| 节点 | 解决的问题 |
+| Node | Problem it solves |
 |---|---|
-| `QwenImage21GGUFEncoder` | GGUF 量化版缺视觉塔导致的**静默降质** | 
-| `Qwen21ScheduledSingleImageEdit` | ComfyUI 部分卸载 → lowvram 降速 |
-| `H3UnloadBeforeDecode` | 多模型共驻 16 GB 导致 HIP launch failure |
-| `large_safetensors` (猴补丁) | safetensors 0.8.0 读 >21 GiB 文件在 Windows 崩溃 |
+| `QwenImage21GGUFEncoder` | **Silent quality loss** — GGUF quants ship without the vision tower |
+| `Qwen21ScheduledSingleImageEdit` | ComfyUI partial unload → lowvram slowdown |
+| `H3UnloadBeforeDecode` | Model co-residency in 16 GB → HIP launch failure |
+| `large_safetensors` (monkey patch) | safetensors 0.8.0 crashes on Windows reading files > 21 GiB |
 
-### ⚠️ 内容分级声明（NSFW / 去审查模型）
+### ⚠️ Content rating disclosure (NSFW / uncensored models)
 
-**本部署中有三个模型属于去审查或无限制类别，可能产出 NSFW 内容。**
-把这一条明确写出来，是因为照本文部署的人有权事先知道自己装的是什么。
+**Three models in this deployment are uncensored or unrestricted and can produce NSFW output.**
+This is stated explicitly because anyone following this document deserves to know what they
+are installing.
 
-| 模型 | 类别 | 说明 |
+| Model | Category | Note |
 |---|---|---|
-| Qwen3.8 27B **abliterated** | 去审查（权重编辑） | `abliterated` 指通过权重正交化移除模型的拒绝行为。**不会拒答任何请求**，包括原版会拒绝的内容 |
-| Qwen3-VL 32B **ultra_uncensored** 变体 | 去审查 | H3 的备用文本编码器。文生视频链路若用它，生成内容不受提示词审查约束 |
-| MN-12B-Mag-Mell-R1 | 社区角色扮演微调 | 面向角色扮演/创意写作，对成人内容无内置限制 |
+| Qwen3.8 27B **abliterated** | Uncensored (weight-edited) | `abliterated` means refusal behavior was removed via weight orthogonalization. **It will not refuse any request**, including things the original model would decline |
+| Qwen3-VL 32B **ultra_uncensored** variant | Uncensored | H3's alternate text encoder. Using it in the video pipeline means generation is not constrained by prompt-level filtering |
+| MN-12B-Mag-Mell-R1 | Community roleplay fine-tune | Aimed at roleplay / creative writing, with no built-in limits on adult content |
 
-**对部署的实际影响 —— 这几条是技术性的，不是说教：**
+**Practical deployment implications — these are technical points, not a lecture:**
 
-1. **§8.2 SillyTavern 的 `whitelistMode: true` 在这个语境下不是可选项。**
-   关掉它等于把无审查模型 + 全部对话历史开放给整个局域网。
-2. **§8.1 Open WebUI 的 `WEBUI_AUTH=False` 同理**，仅在严格回环（`127.0.0.1`）下成立。
-   一旦改成 `0.0.0.0` 必须先打开鉴权。
-3. **§8.3 里 `llama-server` 用的是 `--host 0.0.0.0` 且无鉴权** ——
-   这是全栈里唯一默认局域网可达的服务。如果它加载的是去审查模型，
-   同网段任何设备都能直接调用。不需要远程访问就改成 `127.0.0.1`。
-4. **不适合多用户、共享或有未成年人的环境。** 这几个模型不会自我约束，
-   唯一的边界就是访问控制。
-5. 模型全部本地运行，无遥测（`HF_HUB_DISABLE_TELEMETRY=1`、`--disable-api-nodes`），
-   输出不外发 —— 但也意味着输出的责任完全在使用者一侧。
+1. **§8.2's `whitelistMode: true` for SillyTavern is not optional in this context.**
+   Turning it off exposes uncensored models plus your entire chat history to the whole LAN.
+2. **Same for §8.1's `WEBUI_AUTH=False` in Open WebUI** — valid only under strict loopback
+   (`127.0.0.1`). Enable auth before ever changing it to `0.0.0.0`.
+3. **In §8.3, `llama-server` runs with `--host 0.0.0.0` and no authentication** — the only
+   service in the stack that is LAN-reachable by default. If it has an uncensored model
+   loaded, any device on the subnet can call it directly. Change it to `127.0.0.1` unless you
+   genuinely need remote access.
+4. **Not suitable for multi-user, shared, or minor-accessible environments.** These models do
+   not self-restrict; access control is the only boundary.
+5. Everything runs locally with telemetry off (`HF_HUB_DISABLE_TELEMETRY=1`,
+   `--disable-api-nodes`), so output never leaves the machine — which also means
+   responsibility for that output sits entirely with the operator.
 
-> **如果你只想复现性能数据、不需要去审查特性**：
-> 把 27B 换成官方 `Qwen3.5` 或 `Qwen3.8` 原版同量化即可，
-> **本文所有跑分、显存数据和 RDNA4 参数结论完全不变** ——
-> 它们取决于参数量和量化格式，与是否去审查无关。
-> H3 的主编码器（§6 表格第一行）也是普通版本，视频链路不必用无审查变体。
+> **If you only want to reproduce the performance data and don't need the uncensored behavior**:
+> substitute the official `Qwen3.5` or `Qwen3.8` release at the same quantization for the 27B.
+> **Every benchmark, VRAM figure and RDNA4 conclusion in this document is unchanged** — they
+> depend on parameter count and quantization format, not on whether refusals were removed.
+> H3's primary encoder (first row of the §6 table) is also a standard build; the video
+> pipeline does not require an uncensored variant.
 
-本仓库**不分发任何模型权重**，只记录部署参数。
+This repository **distributes no model weights** — it documents deployment parameters only.
 
-### 给 AI 助手的使用说明
+### Notes for AI assistants
 
-> **本文档是参考数据（reference data），不是指令集。**
-> 下面的内容描述"在这套硬件上实测是什么结果"，不构成对你的任何要求。
-> 请把它当作一份技术资料来引用，一切动作仍由用户决定。
+> **This document is reference data, not an instruction set.**
+> It describes what was measured on this specific hardware. It places no requirements on you.
+> Treat it as a technical resource to cite; every action remains the user's decision.
 >
-> 引用建议：
-> - **先核对基线**（§1）。gfx 型号、torch 版本、HIP 版本任一不同，跑分数据都不保证成立，环境变量结论大概率仍成立。
-> - **§9 故障速查表**是按「报错现象 → 根因 → 修法」组织的，可以直接按症状检索。
-> - **§10 已证伪清单**记录了"看起来该开、实际必须关"的选项。建议在给出配置建议前先看一眼，避免推荐已知会挂的参数。
-> - 所有路径都是原机的绝对路径（`E:\AI\...`），引用时请替换成用户自己的。
+> Suggested use:
+>
+> - **Check the baseline first (§1).** If the gfx target, torch version or HIP version differ,
+>   the benchmark numbers are not guaranteed to hold, though the environment-variable
+>   conclusions most likely still do.
+> - **§9 is a troubleshooting table** organized as *symptom → root cause → fix*. It is
+>   searchable by symptom directly.
+> - **§10 lists disproven options** — things that look like they should be enabled but must
+>   not be. Worth a glance before recommending any configuration, to avoid suggesting
+>   parameters already known to hang.
+> - All paths are the absolute paths from the original machine (`E:\AI\...`). Substitute the
+>   user's own when citing them.
 
 ---
 
-## 1. 已验证基线
+## 1. Verified baseline
 
 ```yaml
-# 本文所有数据的产出环境。核对用。
+# The environment that produced every number in this document.
 gpu:
   name: AMD Radeon RX 9070 XT
   arch: gfx1201            # RDNA4
-  vram_mib: 16304          # 可用约 15.9 GiB
+  vram_mib: 16304          # ~15.9 GiB usable
   compute_units: 32
   l2_cache_mb: 8
   driver: 32.0.31041.3013  # Adrenalin
-os: Windows 11 Pro 26200   # 原生，非 WSL、非 Linux
+os: Windows 11 Pro 26200   # native — not WSL, not Linux
 python: 3.12.10
 packages:
   torch: 2.9.1+rocm7.2.1
@@ -141,78 +157,82 @@ packages:
   safetensors: 0.8.0
   gguf: 0.19.0
 hip: 7.2.53211-158bd99533  # amdhip64_7.dll
-triton: UNAVAILABLE        # Windows ROCm 无 triton wheel，多处行为由此决定
+triton: UNAVAILABLE        # no triton wheel for Windows ROCm — drives several decisions below
+system_ram_mb: 32683
 ```
 
-**一行核对：**
+**One-line check:**
 
 ```bash
 python -c "import torch;print(torch.__version__, torch.version.hip, torch.cuda.get_device_properties(0).gcnArchName)"
-# 期望: 2.9.1+rocm7.2.1 7.2.53211-158bd99533 gfx1201
+# expected: 2.9.1+rocm7.2.1 7.2.53211-158bd99533 gfx1201
 ```
 
-### HIP 后端算子能力（实测，非推测）
+### HIP backend kernel capabilities (measured, not assumed)
 
-`triton` 缺失后，可用后端是 `hip` / `eager`。**`hip` 比 CUDA 后端少 5 类算子**，
-这直接决定了哪些量化格式能选：
+With `triton` missing, the usable backends are `hip` and `eager`.
+**The `hip` backend is missing 5 classes of kernel** compared to the CUDA backend, which
+directly determines which quantization formats are viable:
 
-| 状态 | 算子 |
+| Status | Kernels |
 |---|---|
-| ✅ 可用 | `int8_convrot`、`w4a8_int8_linear`、`svdquant_w4a4`、`gemv_awq_w4a16`、`per_tensor_fp8`、`sol_attn`、`na3d`、`fp16_conv3d`、`rms_rope*`、`adaln` |
-| ❌ 缺失 | `dequantize_int8_convrot_weight`（仅有 `_dtype` 变体）、`dequantize_int8_simple`（同）、`rotate_int8_convrot_weight`、`prepare_int4_weight_for_int8_linear` |
-| ⚠️ **模拟执行** | `nvfp4`、`mxfp8` —— 不报错，但走软件模拟路径，不是原生算子 |
+| ✅ Available | `int8_convrot`, `w4a8_int8_linear`, `svdquant_w4a4`, `gemv_awq_w4a16`, `per_tensor_fp8`, `sol_attn`, `na3d`, `fp16_conv3d`, `rms_rope*`, `adaln` |
+| ❌ Missing | `dequantize_int8_convrot_weight` (only the `_dtype` variant exists), `dequantize_int8_simple` (same), `rotate_int8_convrot_weight`, `prepare_int4_weight_for_int8_linear` |
+| ⚠️ **Emulated** | `nvfp4`, `mxfp8` — they do not error, but run through a software emulation path rather than native kernels |
 
-运行时日志会明确列出这个区分（来自 §6.4 的实测日志）：
+The runtime log states this distinction explicitly (from the §6.4 run):
 
 ```
 Native ops:   float8_e5m2, int8_tensorwise, asym_w4a8_int8, convrot_w4a4, float8_e4m3fn
 emulated ops: nvfp4, mxfp8
 ```
 
-`int8_convrot` 数值校验：`relative_rmse = 0.0126`，`finite = true`，输出 `bf16`。**精度可接受。**
+`int8_convrot` numerical check: `relative_rmse = 0.0126`, `finite = true`, output `bf16`.
+**Accuracy is acceptable.**
 
-**推论：给 RDNA4 推荐量化格式时，`int8_convrot` 和 GGUF 是安全选择。
-`nvfp4` / `mxfp8` 能跑但是模拟的 —— 不会崩，但拿不到量化本该带来的加速，属于"看起来能用实际白费"，
-给建议时要说清楚。**
-
----
-
-## 2. 决策树：该走哪条路
-
-```
-对话模型？
-├── < 10 GiB，只要能用、省事        → Ollama + Vulkan   (§3.1)
-└── > 10 GiB，或要长上下文          → llama.cpp ROCm    (§3.2)
-                                       必须量化 KV cache
-   ├── 要网页界面                   → Open WebUI :8080  (§8.1)
-   └── 要角色扮演界面               → SillyTavern :8000 (§8.2)
-
-文生图？
-├── SDXL / RealVisXL               → §7  ⚠️ 不需要任何 RDNA4 workaround
-│                                      这是排障基准线
-└── Qwen-Image 2.1                 → §5
-    ├── 只生图，不和别的模型共存     → A: Q8_0 GGUF
-    │                                 热跑 40 s，占 14 GB，跑完只剩 2.4 GB
-    └── 要共存 / 之后要跑视频        → B: int8_convrot
-                                      热跑 97 s，稳态仅 6 GB，剩 10.5 GB
-
-文生视频（MiniMax H3）？
-└── 必须独占整卡 + 两个补丁         → §6
-    文本编码器 25.3 GiB > safetensors 0.8.0 的 Windows 崩溃阈值
-
-RDNA4 参数怎么加？
-├── SDXL 等成熟模型                → 默认参数，什么都不用加
-└── Qwen-Image 2.1 / H3            → §4.2 那一套
-    任何情况都绝不开 TunableOp（§10）
-```
+**Implication: when recommending a quantization format for RDNA4, `int8_convrot` and GGUF are
+safe choices. `nvfp4` / `mxfp8` will run but are emulated — they won't crash, but they won't
+deliver the speedup quantization is supposed to buy. Say so explicitly when advising.**
 
 ---
 
-## 3. 对话模型
+## 2. Decision tree
+
+```
+Chat model?
+├── < 10 GiB, just needs to work         → Ollama + Vulkan   (§3.1)
+└── > 10 GiB, or long context            → llama.cpp ROCm    (§3.2)
+                                             MUST quantize KV cache
+   ├── wants a web UI                    → Open WebUI :8080  (§8.1)
+   └── wants a roleplay UI               → SillyTavern :8000 (§8.2)
+
+Text-to-image?
+├── SDXL / RealVisXL                     → §7  ⚠️ needs NO RDNA4 workarounds
+│                                              use this as the troubleshooting baseline
+└── Qwen-Image 2.1                       → §5
+    ├── image gen only, nothing else      → A: Q8_0 GGUF
+    │                                        warm 40 s, 14 GB resident, only 2.4 GB left
+    └── must coexist / video runs next    → B: int8_convrot
+                                             warm 97 s, 6 GB resident, 10.5 GB left
+
+Text-to-video (MiniMax H3)?
+└── must own the whole card + 2 patches  → §6
+    text encoder is 25.3 GiB > the safetensors 0.8.0 Windows crash threshold
+
+Which RDNA4 flags to add?
+├── mature models like SDXL              → defaults, add nothing
+└── Qwen-Image 2.1 / H3                  → the §4.2 set
+    never enable TunableOp, under any circumstances (§10)
+```
+
+---
+
+## 3. Chat models
 
 ### 3.1 Ollama + Vulkan
 
-**RDNA4 当时不在 Ollama 的 ROCm 支持列表里，走 Vulkan 反而稳定。** 用官方便携版。
+**RDNA4 was not on Ollama's ROCm support list at the time — Vulkan is the stable path.**
+Use the official portable build.
 
 ```bat
 set OLLAMA_MODELS=E:\AI\Models\Ollama
@@ -222,18 +242,18 @@ set OLLAMA_VULKAN=1
 "E:\AI\Apps\Ollama\ollama.exe" serve
 ```
 
-实测 —— Qwen3.5 9B Q4（6.6 GB）：
+Measured — Qwen3.5 9B Q4 (6.6 GB):
 
-| 指标 | 数值 |
+| Metric | Value |
 |---|---|
-| GPU 卸载层数 | **34/34 全部上 GPU**（Vulkan0） |
-| 模型显存缓冲 | ~4717 MiB |
-| 主机端占用 | ~546 MiB |
-| **生成速度** | **~24 tok/s** |
-| 提示处理 | 250–340 tok/s |
-| 冷启动 | ~十几秒 |
+| GPU offload | **34/34 layers on GPU** (Vulkan0) |
+| Model VRAM buffer | ~4717 MiB |
+| Host side | ~546 MiB |
+| **Generation** | **~24 tok/s** |
+| Prompt processing | 250–340 tok/s |
+| Cold start | ~15 s |
 
-Modelfile（Qwen3.5 推荐采样参数 + 关思考模式）：
+Modelfile (Qwen3.5 recommended sampling, thinking mode off):
 
 ```
 FROM <blob path>
@@ -248,10 +268,10 @@ PARAMETER presence_penalty 1.5
 
 ### 3.2 llama.cpp ROCm
 
-用 `gfx120X` 预编译包，自带 `amdhip64_7.dll` / `hipblaslt` / `ggml-hip.dll`，
-**不依赖系统装 ROCm SDK**。
+Use the prebuilt `gfx120X` package. It bundles `amdhip64_7.dll`, `hipblaslt` and
+`ggml-hip.dll`, so **a system-wide ROCm SDK install is not required**.
 
-27B（Q3_K，12.6 GiB 本体），16K 上下文：
+27B (Q3_K, 12.6 GiB of weights), 16K context:
 
 ```bat
 llama-server.exe -m "<27B-Q3_K.gguf>" --alias huihui-q3-rocm ^
@@ -259,7 +279,7 @@ llama-server.exe -m "<27B-Q3_K.gguf>" --alias huihui-q3-rocm ^
   --host 0.0.0.0 --port 8081
 ```
 
-12B（Q6_K，9.4 GiB 本体），32K 上下文：
+12B (Q6_K, 9.4 GiB of weights), 32K context:
 
 ```bat
 llama-server.exe -m "<12B-Q6_K.gguf>" --alias mag-mell-12b ^
@@ -267,14 +287,15 @@ llama-server.exe -m "<12B-Q6_K.gguf>" --alias mag-mell-12b ^
   --host 0.0.0.0 --port 8081
 ```
 
-> **量化 KV cache 是 16 GB 卡的胜负手。**
-> 27B Q3_K 本体 12.6 GiB，16K 的 fp16 KV cache 绝对放不下 —— `-ctk q4_0 -ctv q4_0` 才塞得进。
-> 12B 本体小，所以可以给 32K + 更高质量的 `q8_0`。
-> **规则：先算 `本体大小 + KV cache`，再决定 `-c` 和 `-ctk/-ctv`。**
+> **KV cache quantization is the deciding factor on a 16 GB card.**
+> The 27B Q3_K weights alone are 12.6 GiB; an fp16 KV cache at 16K context does not fit —
+> `-ctk q4_0 -ctv q4_0` is what makes it fit. The 12B has smaller weights, so it gets
+> 32K context and the higher-quality `q8_0`.
+> **Rule: compute `weights + KV cache` first, then choose `-c` and `-ctk/-ctv`.**
 
-### 3.3 显存互斥（重要）
+### 3.3 VRAM mutual exclusion (important)
 
-**一张 16 GB 卡上，Ollama 和 llama.cpp 不能共存。** 每个启动脚本开头都要清场：
+**Ollama and llama.cpp cannot coexist on one 16 GB card.** Every launcher clears the field first:
 
 ```powershell
 try{ (Invoke-RestMethod http://127.0.0.1:11434/api/ps -TimeoutSec 3).models.name |
@@ -283,15 +304,14 @@ Get-Process llama-server -EA 0 | ? Path -like '*llama.cpp-rocm*' | Stop-Process 
 for($i=0;$i -lt 10 -and (Get-Process llama-server -EA 0);$i++){ Start-Sleep 2 }
 ```
 
-端口分配：`11434` Ollama / `8081` llama.cpp / `8188` 主生图 / `8190` A-B 测试 / `8192` H3 视频。
-
 ---
 
-## 4. ComfyUI 公共配置
+## 4. ComfyUI shared configuration
 
-### 4.1 缓存离盘（所有工作流通用）
+### 4.1 Caches off the system drive (all workflows)
 
-**系统盘不落任何东西** —— 在 16 GB 卡上反复下载 20 GiB+ 权重时这很关键。
+**Nothing lands on the system drive** — this matters when re-downloading 20 GiB+ weights
+repeatedly on a 16 GB card.
 
 ```bat
 set TEMP=E:\AI\Temp
@@ -306,42 +326,44 @@ set PYTHONNOUSERSITE=1
 set HF_HUB_DISABLE_TELEMETRY=1
 ```
 
-### 4.2 RDNA4 workaround 是**分场景**的，不要一律套用
+### 4.2 RDNA4 workarounds are **per-workflow** — do not apply them blanket
 
-⚠️ **这是本文档一个容易搞错的点。** 下面这套只有**大模型工作流**需要；
-SDXL 这类成熟模型用 ComfyUI 默认参数就能跑，加了反而是白搭。
+⚠️ **This is the easiest thing to get wrong in this document.** The set below is only needed
+by the **large-model workflows**. SDXL-class models run on ComfyUI defaults; adding these
+buys nothing.
 
-| 工作流 | RDNA4 环境变量 | `--disable-pinned-memory` | `--use-pytorch-cross-attention` |
+| Workflow | RDNA4 env vars | `--disable-pinned-memory` | `--use-pytorch-cross-attention` |
 |---|---|---|---|
-| **SDXL**（RealVisXL 等） | ❌ 不需要 | ❌ 不需要 | ❌ 不需要 |
-| **Qwen-Image 2.1** | ✅ 需要 | ✅ 需要 | ✅ 需要 |
-| **MiniMax H3** | ✅ 需要 | ✅ 需要 | ✅ 需要 + 独占参数 |
+| **SDXL** (RealVisXL etc.) | ❌ not needed | ❌ not needed | ❌ not needed |
+| **Qwen-Image 2.1** | ✅ required | ✅ required | ✅ required |
+| **MiniMax H3** | ✅ required | ✅ required | ✅ required + exclusive flags |
 
-大模型工作流才加这一段：
+Only large-model workflows get this block:
 
 ```bat
-rem ==== 仅 Qwen-Image 2.1 / MiniMax H3 需要 ====
+rem ==== Qwen-Image 2.1 / MiniMax H3 only ====
 set TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
 set MIOPEN_FIND_MODE=FAST
-rem TunableOp 已移除，原因见 §10
+rem TunableOp deliberately removed — see §10
 ```
 
 ```
---disable-pinned-memory            ROCm 上 pinned host memory 分配会失败
---use-pytorch-cross-attention      无 triton，退回 PyTorch 原生 SDPA
+--disable-pinned-memory            pinned host memory allocation fails on ROCm
+--use-pytorch-cross-attention      no triton — fall back to PyTorch native SDPA
 ```
 
-全场景都建议加的：
+Recommended everywhere:
 
 ```
---disable-api-nodes                纯本地，不联外部 API
---extra-model-paths-config <yaml>  每个项目一份独立模型路径表，多实例互不干扰
+--disable-api-nodes                fully local, no external API calls
+--extra-model-paths-config <yaml>  per-project model path table; instances stay isolated
 ```
 
-### 4.3 模型目录全部外置
+### 4.3 All model directories are external
 
-`ComfyUI/models/` 下**一个权重都不放**，全是官方的 `put_*_here` 占位文件。
-所有模型通过 `extra_model_paths.yaml` 指到独立数据盘：
+**Not a single weight lives under `ComfyUI/models/`** — it contains only the upstream
+`put_*_here` placeholder files. Everything is resolved through `extra_model_paths.yaml`
+pointing at a separate data drive:
 
 ```yaml
 ai_models:
@@ -359,52 +381,60 @@ sdxl:
   upscale_models: Upscale
 ```
 
-**好处**：ComfyUI 可以随时 `git pull` 或整个删掉重装，权重一个字节都不用动。
-项目级的 `--extra-model-paths-config` 再叠加在这个全局配置之上。
+**Why this matters**: ComfyUI can be `git pull`ed or deleted and reinstalled outright without
+touching a single byte of weights. Per-project `--extra-model-paths-config` then layers on
+top of this global config.
 
 ---
 
-## 5. Qwen-Image 2.1 文生图
+## 5. Qwen-Image 2.1 text-to-image
 
-### 5.1 权重固定与校验
+### 5.1 Pinned weights and verification
 
-**用 `resolve/<commit>/` 而不是 `resolve/main/`** —— main 会漂移，跑分立刻不可复现。
+**Use `resolve/<commit>/`, not `resolve/main/`** — main drifts, and benchmarks stop being
+reproducible immediately.
 
-来源：`huggingface.co/Comfy-Org/Qwen-Image-2.1` @ `9a44dbdb47cefd046be9c0a13476192f34c8db8e`
+Source: `huggingface.co/Comfy-Org/Qwen-Image-2.1` @ `9a44dbdb47cefd046be9c0a13476192f34c8db8e`
 
-| 文件 | 字节 | SHA256 (前 16) | 校验 |
+| File | Bytes | SHA256 (first 16) | Verified |
 |---|---|---|---|
 | `diffusion_models/qwen_image_2.1_int8_convrot.safetensors` | 7,256,783,064 | `cb74113cb03faecd` | ✅ |
 | `text_encoders/qwen3vl_8b_int8_convrot.safetensors` | 9,350,798,360 | `8bfd0f6e12abf2d2` | ✅ |
 | `vae/qwen_image_2.1_vae_bf16.safetensors` | 675,509,688 | `bb21f7473051e1ac` | ✅ |
 
-### 5.2 A/B 跑分（1024×1024，20 步）
+### 5.2 A/B benchmark (1024×1024, 20 steps)
 
-**本文最核心的数据。同一张卡上两条路线是速度与显存的直接取舍：**
+**The most useful data here. On one card the two routes are a direct speed-vs-VRAM trade:**
 
-| 方案 | 扩散模型 | 冷跑 | **热跑** | **稳态显存** | 峰值分配 | **跑完剩余** |
+| Route | Diffusion model | Cold | **Warm** | **Resident VRAM** | Peak allocated | **Free after** |
 |---|---|---|---|---|---|---|
 | **A** | `Q8_0` GGUF (7.6 GiB) | 294.7 s | **40.4 s** | 14.03 GB | 15.88 GiB | **2.38 GB** |
 | **B** | `int8_convrot` (7.3 GiB) | 155.9 s | **97.4 s** | **6.02 GB** | 15.82 GiB | **10.49 GB** |
 
-两方案的文本编码器都是 `Qwen3VL-8B-Instruct-Q4_K_M.gguf`，VAE 都是 `qwen_image_2.1_vae_bf16`。
-seed42 = 冷跑，seed43 = 热跑。B 的首次运行含磁盘冷加载为 363.9 s。
+Both routes use `Qwen3VL-8B-Instruct-Q4_K_M.gguf` as the text encoder and
+`qwen_image_2.1_vae_bf16` as the VAE. seed42 = cold, seed43 = warm. Route B's very first
+run, including cold load from disk, took 363.9 s.
 
-**结论（可直接用于给用户建议）：**
+**Conclusions (directly usable when advising a user):**
 
-1. **A 热跑快 2.4 倍**，但跑完只剩 2.38 GB —— 卡被占满，同时开任何别的模型必崩。
-2. **B 稳态只占 6 GB**，留出 10.5 GB 调度余量，代价是慢一倍多。
-3. **两者峰值都顶到约 15.9 GiB，即这张卡的物理上限。**
-   意味着 1024×1024 就是 16 GB 上不加额外 offload 的天花板 ——
-   **用户想要更高分辨率时，必须先谈 offload 或降分辨率，不要直接答"可以"。**
+1. **A is 2.4× faster warm**, but leaves only 2.38 GB free — the card is full, and anything
+   else started alongside it will fail.
+2. **B holds only 6 GB resident**, leaving 10.5 GB of scheduling headroom, at the cost of
+   being roughly twice as slow.
+3. **Both peak at ~15.9 GiB, i.e. the card's physical limit.** So 1024×1024 is the ceiling on
+   16 GB without extra offload — **if a user wants higher resolution, discuss offload or a
+   lower resolution first; do not simply say yes.**
 
-### 5.3 自研节点 · GGUF 文本编码器（补回视觉塔）
+### 5.3 Custom node · GGUF text encoder (restoring the vision tower)
 
-**问题**：Qwen3-VL 的 GGUF 量化版**只含语言塔，不含视觉塔**。
-直接用 `CLIPLoaderGGUF` 加载，视觉权重是未初始化的随机值 —— 图能出，但 Qwen3-VL 的图像理解全废。
-**这是静默失败，表现只是"质量微妙地差"，极难 debug。**
+**Problem**: GGUF quants of Qwen3-VL **contain only the language tower, not the vision tower**.
+Loading one through `CLIPLoaderGGUF` leaves the vision weights uninitialized and random —
+images still come out, but Qwen3-VL's image understanding is entirely broken.
+**This is a silent failure whose only symptom is "quality is subtly worse", and it is
+extremely hard to debug.**
 
-**解法**：GGUF 出语言塔，原始 safetensors 出视觉塔，合并后交给 ComfyUI 官方 patcher。
+**Fix**: take the language tower from the GGUF, the vision tower from the original
+safetensors, merge, then hand off to ComfyUI's own patcher.
 
 ```python
 class QwenImage21GGUFEncoder:
@@ -413,14 +443,14 @@ class QwenImage21GGUFEncoder:
         path = folder_paths.get_full_path_or_raise('clip_gguf', clip_name)
         sd = loader.load_data([path])[0]
 
-        # 从原始 safetensors 补回视觉塔
+        # restore the vision tower from the original safetensors
         source = folder_paths.get_full_path_or_raise('text_encoders', vision_source)
         with safe_open(source, framework='pt', device='cpu') as f:
             for key in f.keys():
                 if key.startswith('model.visual.'):
                     sd[key] = f.get_tensor(key)
 
-        # 断言式校验：宁可崩，不要静默出坏图
+        # assert rather than silently produce bad images
         if 'model.visual.deepstack_merger_list.0.norm.weight' not in sd:
             raise ValueError('vision_source must contain the original Qwen3-VL vision tower.')
 
@@ -431,19 +461,21 @@ class QwenImage21GGUFEncoder:
         return (clip,)
 ```
 
-**收益**：5.0 GiB 的 Q4_K_M 语言塔 + 原始视觉塔，替代 9.4 GiB 全精度编码器，省 4.4 GiB。
-两处断言都是故意的 —— 静默降质比崩溃难查得多。
+**Payoff**: a 5.0 GiB Q4_K_M language tower plus the original vision tower replaces the
+9.4 GiB full-precision encoder — 4.4 GiB saved. Both assertions are deliberate: silent
+degradation is far harder to diagnose than a crash.
 
-### 5.4 自研节点 · 确定性 VRAM 调度器
+### 5.4 Custom node · deterministic VRAM scheduler
 
-**问题**：ComfyUI 默认的 `mm.free_memory()` **只释放差额**。
-结果是扩散模型被 *部分* 卸载并打上 lowvram 补丁，性能断崖式下降。
+**Problem**: ComfyUI's `mm.free_memory()` **only frees the shortfall**. The result is that the
+diffusion model gets *partially* unloaded and patched into lowvram mode, with a cliff-edge
+performance drop.
 
-**解法**：传一个荒谬的显存需求值进去，强制**完整**卸载。
+**Fix**: pass an absurd memory requirement to force a **complete** unload.
 
 ```python
 def _evict_other_gpu_models(clip_patcher):
-    # 传 1e30 绕开 ComfyUI 只释放差额的部分卸载行为
+    # 1e30 bypasses ComfyUI's "free only the shortfall" partial-unload behavior
     device = clip_patcher.load_device
     keep = _loaded_entries_for(clip_patcher)
     with torch.inference_mode():
@@ -452,24 +484,26 @@ def _evict_other_gpu_models(clip_patcher):
             mm.soft_empty_cache()
 ```
 
-调度时序：
+Scheduling order:
 
 ```
-prompt / 参考图变了:
-  ① 完整驱逐扩散模型 → ② 调官方 TextEncodeQwenImage21
-  → ③ 完整卸载文本编码器 → ④ 采样器加载扩散模型
-只改 seed:
-  ComfyUI 命中本节点缓存，零次模型交换
+prompt / reference image changed:
+  ① fully evict diffusion → ② call the official TextEncodeQwenImage21
+  → ③ fully unload the text encoder → ④ let the sampler load diffusion
+seed only changed:
+  ComfyUI hits this node's cache — zero model swaps
 ```
 
-**关键设计**：prompt 和参考图必须是**这个节点自己的输入**。
-这样"改 prompt"才会让本节点缓存失效、触发预驱逐；"只改 seed"则整个节点被缓存跳过，
-扩散模型可以一直驻留。**用 ComfyUI 的缓存粒度做调度，而不是手写状态机。**
+**The key design point**: the prompt and reference image must be inputs of **this node itself**.
+That is what makes "prompt changed" invalidate the node and trigger pre-eviction, while
+"seed only changed" skips the node entirely via cache, letting diffusion stay resident.
+**Scheduling via ComfyUI's cache granularity, rather than a hand-written state machine.**
 
-两个 API 坑：
+Two API gotchas:
 
-- 官方节点收的是 `images={"image_1": image_1}` **一个字典**，不是 `image_1=` 关键字参数。
-- 新版 ComfyUI 的 `io.NodeOutput` 要从 `.args` 取返回值：
+- The official node takes `images={"image_1": image_1}`, **a single dict** — not an `image_1=`
+  keyword argument.
+- Newer ComfyUI returns `io.NodeOutput`; read results from `.args`:
 
 ```python
 if hasattr(out, "args"):
@@ -478,14 +512,14 @@ else:
     positive, negative, latent = tuple(out)[:3]
 ```
 
-### 5.5 端口互斥保护
+### 5.5 Port mutual-exclusion guard
 
-16 GB 装不下两份 ComfyUI。启动脚本先查端口，已在跑就只开网页：
+Two ComfyUI instances do not fit in 16 GB. Launchers check the port first:
 
 ```bat
 netstat -ano | findstr /R /C:"127.0.0.1:8190 .*LISTENING" >nul
 if not errorlevel 1 (
-    echo [提示] 8190 已有 ComfyUI 在跑，直接打开网页。
+    echo [info] 8190 already serving ComfyUI - just opening the page.
     start "" http://127.0.0.1:8190
     exit /b
 )
@@ -493,30 +527,31 @@ if not errorlevel 1 (
 
 ---
 
-## 6. MiniMax H3 文生视频
+## 6. MiniMax H3 text-to-video
 
-**最难的一个。53 GiB 权重，其中单个文件 25.3 GiB，超过显存容量的 1.5 倍。**
+**The hardest one. 53 GiB of weights, including a single 25.3 GiB file — 1.5× the card's VRAM.**
 
-权重清单（单独放机械盘，用 `--extra-model-paths-config` 指过去）：
+Weights live on a separate mechanical drive, reached via `--extra-model-paths-config`:
 
-| 文件 | 大小 |
+| File | Size |
 |---|---|
 | `text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors` | 25.3 GiB |
 | `diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors` | 19.5 GiB |
 | `vae/minimax_h3_video_vae_fp16.safetensors` | 4.9 GiB |
 | `vae/minimax_h3_audio_vae_fp32.safetensors` | 577 MiB |
 
-### 6.1 必须打的补丁 A：safetensors 0.8.0 在 Windows 上崩溃
+### 6.1 Required patch A: safetensors 0.8.0 crashes on Windows
 
-**这是上游 bug，官方文档没有，单独记一笔：**
+**An upstream bug, undocumented anywhere official, worth recording on its own:**
 
-> `safetensors 0.8.0` 的 `safe_open(framework="pt")` 在 Windows 上对**任何超过约 21 GiB
-> 的文件**执行 `get_tensor()` 时触发访问违规 `0xC0000005`，直接杀掉整个 ComfyUI 进程。
-> 用合成文件二分验证过：**20 GiB 正常，23 GiB 崩溃**。
-> H3 的文本编码器 25.3 GiB，所以 `CLIPLoader` 必挂。
+> `safetensors 0.8.0`'s `safe_open(framework="pt")` triggers an access violation
+> `0xC0000005` on `get_tensor()` for **any file larger than roughly 21 GiB** on Windows,
+> killing the entire ComfyUI process. Bisected with synthetic files: **20 GiB works,
+> 23 GiB crashes.** H3's text encoder is 25.3 GiB, so `CLIPLoader` is guaranteed to die.
 
-**解法**：只替换 `comfy.utils` 持有的那个引用。超过阈值的文件走只读 mmap + `torch.frombuffer`，
-其余照旧走真正的 `safetensors.safe_open`。只读的文件映射页不计入 commit charge。
+**Fix**: swap only the reference held by `comfy.utils`. Files above the threshold go through a
+read-only mmap plus `torch.frombuffer`; everything else still uses the real
+`safetensors.safe_open`. Read-only file-backed pages do not add commit charge.
 
 ```python
 LIMIT = 16 * 1024 ** 3
@@ -532,7 +567,7 @@ class MMapSafeOpen:
         self.mv = memoryview(self.mm)
 
     def __exit__(self, *exc):
-        return False        # 张量持有 mmap 的视图，不能关闭
+        return False        # tensors hold views into the mmap - it must stay open
 
     def get_tensor(self, name):
         info = self.header[name]
@@ -553,22 +588,25 @@ comfy.utils.safetensors = types.SimpleNamespace(
     safe_open=safe_open, torch=safetensors.torch)
 ```
 
-**注意 `__exit__` 必须返回而不关闭 mmap** —— 张量是 buffer 的视图，关了就是悬垂指针。
+**Note that `__exit__` must return without closing the mmap** — the tensors are buffer views,
+and closing it leaves dangling pointers.
 
-### 6.2 必须打的补丁 B：VAE 解码前清空整卡
+### 6.2 Required patch B: empty the card before VAE decode
 
-16 GB RDNA4 上，采样完成后若扩散模型、文本编码器、两个 VAE 共存，
-会出现**共驻减速和 HIP launch failure**（对应 ComfyUI issue #15484）。
+On a 16 GB RDNA4 card, leaving the diffusion model, text encoder and both VAEs co-resident
+after sampling produces **co-residency slowdown and HIP launch failures**
+(matching ComfyUI issue #15484).
 
-**解法**：在 `SamplerCustomAdvanced` 和两个 VAE decode 之间插一个门控节点。
-latent 必须**穿过**这个节点，以此保证它在采样之后、解码之前执行。
+**Fix**: insert a gate node between `SamplerCustomAdvanced` and the two VAE decodes. The
+latent must **flow through** the node, which is what guarantees it runs after sampling and
+before decoding.
 
 ```python
 class H3UnloadBeforeDecode:
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": {"latent": ("LATENT",)}}
-    RETURN_TYPES = ("LATENT",)      # latent 穿过本节点 = 强制执行时序
+    RETURN_TYPES = ("LATENT",)      # latent flows through = enforced ordering
 
     def unload(self, latent):
         device = mm.get_torch_device()
@@ -578,9 +616,9 @@ class H3UnloadBeforeDecode:
         return (latent,)
 ```
 
-### 6.3 启动参数
+### 6.3 Launch flags
 
-H3 **必须独占整张卡**。启动脚本先检查 8188/8190 是否占用并警告：
+H3 **must own the whole card**. The launcher warns if 8188 or 8190 are in use:
 
 ```bat
 venv\Scripts\python.exe main.py ^
@@ -591,34 +629,37 @@ venv\Scripts\python.exe main.py ^
   --auto-launch
 ```
 
-`--disable-dynamic-vram --reserve-vram 1` 是 H3 专用，其他工作流不需要加。
+`--disable-dynamic-vram --reserve-vram 1` is H3-specific; other workflows do not need it.
 
-### 6.4 实测跑分
+### 6.4 Measured benchmark
 
-**单次成功运行：10 步，总计 277.87 秒。** 数据来自运行日志，非推算。
+**One successful run: 10 steps, 277.87 seconds total.** Taken from the run log, not extrapolated.
 
-机器可用资源：`Total VRAM 16304 MB, total RAM 32683 MB`，`vram state = NORMAL_VRAM`。
+Machine resources: `Total VRAM 16304 MB, total RAM 32683 MB`, `vram state = NORMAL_VRAM`.
 
-#### 模型加载：两个都是"部分加载"，但都没退化成 lowvram
+#### Model loading: both partial, neither degraded to lowvram
 
-| 模型 | 可用 | 实际载入 GPU | 卸载到 CPU | 缓冲保留 | **lowvram patches** |
+| Model | Usable | Loaded to GPU | Offloaded to CPU | Buffer reserved | **lowvram patches** |
 |---|---|---|---|---|---|
-| 文本编码器（Qwen3-VL 32B, 25.3 GiB） | 14293.74 MB | 13418.44 MB | **12465.00 MB** | 875.29 MB | **0** ✅ |
-| 扩散模型（19.5 GiB） | 13866.61 MB | 13386.64 MB | **6609.51 MB** | 661.52 MB | **0** ✅ |
+| Text encoder (Qwen3-VL 32B, 25.3 GiB) | 14293.74 MB | 13418.44 MB | **12465.00 MB** | 875.29 MB | **0** ✅ |
+| Diffusion model (19.5 GiB) | 13866.61 MB | 13386.64 MB | **6609.51 MB** | 661.52 MB | **0** ✅ |
 
-> **`lowvram patches: 0` 是这里最关键的一行。**
-> 模型确实被拆开了（合计约 19 GB 卸到 CPU），但**没有触发 ComfyUI 的 lowvram 降级路径** ——
-> 也就是说 §5.4 说的那种断崖式降速在 H3 这条路上没有发生。
-> 排障时先 grep 这一行：非 0 就说明落进了降级路径。
+> **`lowvram patches: 0` is the single most important line here.**
+> The models were genuinely split (about 19 GB offloaded to CPU in total), but
+> **ComfyUI's lowvram degradation path was never triggered** — meaning the cliff-edge
+> slowdown described in §5.4 did not happen on the H3 route.
+> When troubleshooting, grep for this line first: anything non-zero means you fell into
+> the degraded path.
 
-另外注意：25.3 GiB 的编码器需要把 12.5 GB 卸到 CPU，而这台机器只有 32 GB RAM。
-**这正是 §6.1 的 mmap 方案除了绕过崩溃之外的第二个价值** ——
-只读的文件映射页不计入 commit charge，否则 32 GB 内存也会很紧张。
+Also note: the 25.3 GiB encoder needs 12.5 GB offloaded to CPU, and this machine has only
+32 GB of RAM. **This is the second value of the §6.1 mmap approach beyond avoiding the
+crash** — read-only file-backed pages don't count toward commit charge, or 32 GB would be
+uncomfortably tight too.
 
-#### 采样：10 步 55 秒
+#### Sampling: 10 steps in 55 s
 
 ```
- 1/10  13.41 s/it   ← 首步含 kernel 编译
+ 1/10  13.41 s/it   <- first step includes kernel compilation
  2/10   8.82 s/it
  3/10   7.81 s/it
  4/10   7.30 s/it
@@ -627,80 +668,85 @@ venv\Scripts\python.exe main.py ^
  7/10   5.00 s/it
  8/10   4.45 s/it
  9/10   4.14 s/it
-10/10   3.98 s/it   ← 收敛值
-────────────────────
-总计 55 s，平均 5.52 s/it
+10/10   3.98 s/it   <- converged
+─────────────────────
+55 s total, 5.52 s/it average
 ```
 
-**首步 13.41 s、末步 3.98 s，相差 3.4 倍。** 首步包含 MIOpen kernel 选择和
-AOTriton 注意力内核的首次编译，之后单调收敛到约 4 s/it。
-**评估 H3 性能时必须用收敛值，用首步或平均值都会低估这张卡。**
+**First step 13.41 s, last step 3.98 s — a 3.4× spread.** The first step includes MIOpen
+kernel selection and the first compile of the AOTriton attention kernel, after which it
+converges monotonically to about 4 s/it.
+**Always evaluate H3 performance on the converged value; the first step or the average both
+understate this card.**
 
-日志里能看到 `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` 确实生效了：
+The log confirms `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` is actually taking effect:
 
 ```
 UserWarning: Using AOTriton backend for Efficient Attention forward...
 (aten/src/ATen/native/transformers/hip/attention.hip:1452)
 ```
 
-#### 时间去向拆解
+#### Where the time goes
 
-| 阶段 | 耗时 | 占比 |
+| Stage | Time | Share |
 |---|---|---|
-| 模型加载 + 文本编码（53 GiB 权重从机械盘读入 + 量化解包） | ~215 s | **77%** |
-| 采样（10 步） | 55 s | 20% |
-| 双 VAE 解码 | ~8 s | 3% |
-| **合计** | **277.87 s** | |
+| Model load + text encode (53 GiB read from a mechanical drive + quant unpacking) | ~215 s | **77%** |
+| Sampling (10 steps) | 55 s | 20% |
+| Dual VAE decode | ~8 s | 3% |
+| **Total** | **277.87 s** | |
 
-> **瓶颈是加载，不是计算。** 采样只占 20%。
-> 想加快 H3，方向是把权重挪到 SSD / 减少重复加载，而不是调采样参数。
-> （本机 H3 权重在机械盘上，日志里 `fast_disk=False` 就是这个意思。）
+> **The bottleneck is loading, not compute.** Sampling is only 20% of wall time.
+> To speed up H3, move the weights to an SSD or avoid reloading — not tune sampler settings.
+> (On this machine H3's weights are on a mechanical drive; `fast_disk=False` in the log is
+> exactly that.)
 
-#### VAE 解码阶段
+#### VAE decode stage
 
 ```
 [H3-VRAM-Gate] free VRAM 15359 -> 15357 MB
-Requested to load MiniMaxH3AudioVAE  → 577.08 MB, full load: True
-Requested to load MiniMaxH3VideoVAE  → 4966.19 MB, full load: True
+Requested to load MiniMaxH3AudioVAE  -> 577.08 MB, full load: True
+Requested to load MiniMaxH3VideoVAE  -> 4966.19 MB, full load: True
 ```
 
-`model_type FLOW_AV` —— 音视频联合流模型，音频和视频各一个 VAE，都是完整加载。
+`model_type FLOW_AV` — a joint audio-video flow model, one VAE each, both fully loaded.
 
-⚠️ **诚实说明**：这次运行里门控节点只释放了 2 MB（15359 → 15357），
-说明采样结束时 ComfyUI 已经自己把模型驱逐干净了。
-**所以这条日志不能证明门控节点"救了"这次运行** —— 它在这一次更像是保险而非必需。
-它的价值在于保证时序确定：不依赖 ComfyUI 恰好做对。
+⚠️ **Honest caveat**: in this run the gate node freed only 2 MB (15359 → 15357), meaning
+ComfyUI had already evicted the models by the end of sampling.
+**So this log does not prove the gate node "saved" this run** — here it acted as insurance
+rather than a necessity. Its value is guaranteeing deterministic ordering instead of relying
+on ComfyUI happening to get it right.
 
-### 6.5 未解决问题：音频分支报 `audio_scale`
+### 6.5 Open issue: audio branch fails on `audio_scale`
 
-第二次运行在 148.23 秒时失败：
+A second run failed at 148.23 seconds:
 
 ```
 !!! Exception during processing !!!
 AttributeError: 'ModelSamplingAdvanced' object has no attribute 'audio_scale'
 ```
 
-`model_type` 是 `FLOW_AV`（音视频联合），采样节点需要携带 `audio_scale` 属性，
-而 `ModelSamplingAdvanced` 没有这个属性。**换用支持 AV 的采样节点即可，
-但本机尚未验证哪个节点是对的，所以音频分支目前算未跑通。**
+`model_type` is `FLOW_AV` (joint audio-video), so the sampling node must carry an
+`audio_scale` attribute, which `ModelSamplingAdvanced` does not have. **Switching to an
+AV-capable sampling node should fix it, but which node is correct has not been verified on
+this machine, so the audio branch is currently not working.**
 
-> 视频分支（277.87 s 那次）是完整成功的。这个报错只影响音频输出。
-> 如果你在 H3 上遇到同样的报错，**不是 RDNA4 的问题** —— 是节点选择问题，
-> 和显卡无关，NVIDIA 上同样会报。
+> The video branch (the 277.87 s run) succeeded completely. This error only affects audio output.
+> If you hit the same error on H3, **it is not an RDNA4 problem** — it is a node selection
+> issue, unrelated to the GPU, and will reproduce on NVIDIA too.
 
 ---
 
-## 7. SDXL 文生图（ComfyUI / ForgeNeo 双前端）
+## 7. SDXL text-to-image (dual frontend: ComfyUI / ForgeNeo)
 
-**和上面两个大模型形成对照：SDXL 在 RDNA4 上不需要任何 workaround。**
-这是判断"某个报错是 RDNA4 的锅、还是这个模型自己的锅"的基准线。
+**The contrast with the two large models above: SDXL needs no workarounds on RDNA4.**
+This is the baseline for deciding whether an error is RDNA4's fault or the model's.
 
-模型：`RealVisXL_V5.0_fp16.safetensors`（6.9 GiB，SDXL 架构）
+Model: `RealVisXL_V5.0_fp16.safetensors` (6.9 GiB, SDXL architecture)
 
-### 7.1 ComfyUI 路线
+### 7.1 ComfyUI route
 
-启动参数干净得多 —— **没有** RDNA4 环境变量，**没有** `--disable-pinned-memory`，
-**没有** `--use-pytorch-cross-attention`：
+Much cleaner launch flags — **no** RDNA4 env vars, **no** `--disable-pinned-memory`,
+**no** `--use-pytorch-cross-attention`:
 
 ```bat
 venv\Scripts\python.exe main.py ^
@@ -711,21 +757,22 @@ venv\Scripts\python.exe main.py ^
   --auto-launch
 ```
 
-模型走 §4.3 里 `extra_model_paths.yaml` 的 `sdxl` 段，不用复制进 ComfyUI 目录。
+Models resolve through the `sdxl` block of `extra_model_paths.yaml` in §4.3 — no copying into
+the ComfyUI tree.
 
-### 7.2 ForgeNeo 路线（同一份权重）
+### 7.2 ForgeNeo route (same weights)
 
-`COMMANDLINE_ARGS` **留空**即可，默认参数在 RDNA4 上直接能跑：
+Leave `COMMANDLINE_ARGS` **empty**; the defaults work on RDNA4 as-is:
 
 ```bat
 set COMMANDLINE_ARGS=
-:: 下面这些都试过，SDXL 场景不需要，注释掉备查
+:: all tried, none needed for SDXL - kept commented for reference
 :: --xformers --sage --uv
 :: --pin-shared-memory --cuda-malloc --cuda-stream
 call webui.bat
 ```
 
-`config.json` 只改输出目录，让两个前端的产物都落到同一个数据盘：
+`config.json` only redirects output, so both frontends write to the same data drive:
 
 ```json
 {
@@ -738,38 +785,38 @@ call webui.bat
 }
 ```
 
-> **推论（可直接用于排障）**：如果用户在 RDNA4 上跑 SDXL 遇到问题，
-> **先不要往 ROCm workaround 的方向查** —— SDXL 这条路是干净的，
-> 问题更可能在模型文件、VAE 或前端配置上。反过来，Qwen-Image 2.1 / H3 出问题，
-> 优先查 §9 那张表。
+> **Implication (directly usable for troubleshooting)**: if a user hits a problem running SDXL
+> on RDNA4, **do not start by looking at ROCm workarounds** — this path is clean, so the
+> problem is more likely the model file, the VAE, or frontend configuration. Conversely, for
+> Qwen-Image 2.1 / H3 problems, check the §9 table first.
 
 ---
 
-## 8. 对话前端
+## 8. Chat frontends
 
-两个前端都是纯本地回环，不对外暴露。
+Both are strictly loopback and not exposed externally.
 
-### 8.1 Open WebUI（接 Ollama，端口 8080）
+### 8.1 Open WebUI (talks to Ollama, port 8080)
 
 ```bat
 set "DATA_DIR=%ROOT%data"
 set "OLLAMA_BASE_URL=http://127.0.0.1:11434"
-set "ENABLE_OPENAI_API=False"     rem 不连外部 API，纯本地
-set "WEBUI_AUTH=False"            rem 仅因为只监听 127.0.0.1
-set "HF_ENDPOINT=https://hf-mirror.com"   rem 国内镜像，拉 embedding 模型用
+set "ENABLE_OPENAI_API=False"     rem no external APIs, fully local
+set "WEBUI_AUTH=False"            rem acceptable ONLY because it listens on 127.0.0.1
+set "HF_ENDPOINT=https://hf-mirror.com"   rem regional mirror for embedding models
 set "PYTHONUTF8=1"
 
 venv\Scripts\open-webui.exe serve --host 127.0.0.1 --port 8080
 ```
 
-⚠️ **`WEBUI_AUTH=False` 只在严格回环监听时才可接受。**
-一旦把 `--host` 改成 `0.0.0.0` 或做端口转发，必须先把它改回 `True`，
-否则局域网内任何人都能直接用你的模型。
+⚠️ **`WEBUI_AUTH=False` is only acceptable with strict loopback binding.**
+The moment `--host` becomes `0.0.0.0` or a port forward is added, set it back to `True`, or
+anyone on the LAN can use your models directly.
 
-启动脚本做了三件有用的事：
+The launcher does three useful things:
 
-**① 先清场再启动**，并且**读 Windows 性能计数器把实际显存占用打出来**
-（Windows 上没有 `nvidia-smi`，这是个实用替代）：
+**① Clears the field before starting**, and **reads a Windows performance counter to print
+actual VRAM usage** — a practical substitute for the missing `nvidia-smi` on AMD:
 
 ```powershell
 $v = (Get-Counter '\GPU Adapter Memory(*)\Dedicated Usage').CounterSamples |
@@ -777,14 +824,14 @@ $v = (Get-Counter '\GPU Adapter Memory(*)\Dedicated Usage').CounterSamples |
 'VRAM in use: {0:N2} GB' -f ($v.CookedValue/1GB)
 ```
 
-**② Ollama 没跑就拉起来**，不重复启动：
+**② Starts Ollama only if it isn't already running:**
 
 ```bat
 tasklist /FI "IMAGENAME eq ollama.exe" | find /I "ollama.exe" >nul ^
   || start "" /B "E:\AI\Apps\Ollama\ollama.exe" serve
 ```
 
-**③ 轮询 `/health` 就绪后才开浏览器**，避免开出一个报错页：
+**③ Polls `/health` before opening the browser**, so you never land on an error page:
 
 ```powershell
 for($i=0;$i -lt 120;$i++){
@@ -794,149 +841,157 @@ for($i=0;$i -lt 120;$i++){
 }
 ```
 
-### 8.2 SillyTavern（接 llama.cpp 的 OpenAI 兼容端点，端口 8000）
+### 8.2 SillyTavern (talks to llama.cpp's OpenAI-compatible API, port 8000)
 
-Node.js 应用，接 §3.2 那两个 `llama-server` 暴露的 OpenAI 兼容 API（`:8081`）。
+A Node.js app pointed at the OpenAI-compatible API exposed by the `llama-server` instances
+in §3.2 (`:8081`).
 
-`config.yaml` 关键项：
+Key `config.yaml` entries:
 
 ```yaml
 port: 8000
-listen: true             # 配合 whitelistMode 使用
-whitelistMode: true      # ✅ 只有白名单 IP 能连，这是主要防线
+listen: true             # used together with whitelistMode
+whitelistMode: true      # only whitelisted IPs can connect - this is the main defense
 basicAuthMode: false
-securityOverride: false  # ✅ 保持 false，它会绕过白名单检查
+securityOverride: false  # keep false; it bypasses the whitelist check
 enableCorsProxy: false
 dataRoot: ./data
 ```
 
-> **`listen: true` + `whitelistMode: true` 是安全的组合**；
-> 把 `whitelistMode` 关掉或把 `securityOverride` 打开，就等于把角色卡和对话历史
-> 开放给整个局域网。改这两项前务必想清楚。
+> **`listen: true` + `whitelistMode: true` is a safe combination.** Turning off
+> `whitelistMode` or turning on `securityOverride` exposes character cards and chat history
+> to the entire LAN. Think carefully before changing either.
 
-启动：`Start.bat`（先 `npm install --omit=dev --ignore-scripts` 再 `node server.js`）。
+Launch: `Start.bat` (runs `npm install --omit=dev --ignore-scripts`, then `node server.js`).
 
-### 8.3 端口总表
+### 8.3 Port map
 
-| 端口 | 服务 | 监听 |
+| Port | Service | Binding |
 |---|---|---|
 | 11434 | Ollama API | 127.0.0.1 |
-| 8081 | llama.cpp `llama-server`（OpenAI 兼容） | 0.0.0.0 ⚠️ |
+| 8081 | llama.cpp `llama-server` (OpenAI-compatible) | 0.0.0.0 ⚠️ |
 | 8080 | Open WebUI | 127.0.0.1 |
-| 8000 | SillyTavern | 白名单模式 |
-| 8188 | ComfyUI 主生图 / SDXL | 127.0.0.1 |
-| 8190 | ComfyUI Qwen 2.1 A-B 测试 | 127.0.0.1 |
-| 8192 | ComfyUI MiniMax H3 视频 | 127.0.0.1 |
-| 7860 | ForgeNeo（默认） | 127.0.0.1 |
+| 8000 | SillyTavern | whitelist mode |
+| 8188 | ComfyUI main / SDXL | 127.0.0.1 |
+| 8190 | ComfyUI Qwen 2.1 A/B | 127.0.0.1 |
+| 8192 | ComfyUI MiniMax H3 video | 127.0.0.1 |
+| 7860 | ForgeNeo (default) | 127.0.0.1 |
 
-⚠️ `llama-server` 用的是 `--host 0.0.0.0`，**局域网可达且无鉴权**。
-如果不需要从别的设备连，改成 `--host 127.0.0.1`。
+⚠️ `llama-server` uses `--host 0.0.0.0`, so it is **LAN-reachable with no authentication**.
+Change it to `--host 127.0.0.1` if you don't need access from other devices.
 
 ---
 
-## 9. 故障速查表
+## 9. Troubleshooting table
 
-按现象检索。**这些全部是实测遇到并解决的，不是推测。**
+Searchable by symptom. **Every row was actually encountered and resolved — none are speculative.**
 
-| 现象 | 根因 | 修法 |
+| Symptom | Root cause | Fix |
 |---|---|---|
-| 首次推理挂死，跑 25 分钟零输出 | TunableOp 在 Windows+RDNA4 上损坏 | 删掉 `PYTORCH_TUNABLEOP_ENABLED`，改用 `MIOPEN_FIND_MODE=FAST` |
-| ComfyUI 进程直接消失，无 traceback，退出码 `0xC0000005` | `safetensors 0.8.0` 读 >21 GiB 文件访问违规 | 打 §6.1 的 mmap 补丁 |
-| pinned host memory 分配失败 | ROCm 不支持该路径 | 加 `--disable-pinned-memory` |
-| flash-attn / triton 相关 ImportError | Windows ROCm 无 triton wheel | 加 `--use-pytorch-cross-attention` |
-| VAE decode 阶段 HIP launch failure 或极慢 | 多模型共驻 16 GB（ComfyUI #15484） | 解码前插 §6.2 的门控节点 |
-| 出图能出但质量微妙地差 | GGUF 只含语言塔，视觉塔未初始化 | 用 §5.3 的编码器补回视觉塔 |
-| 扩散模型突然变慢、日志出现 lowvram | ComfyUI 只释放差额 → 部分卸载 | 用 §5.4 的 `free_memory(1e30, ...)` 强制完整卸载 |
-| 27B 模型加载后 OOM | fp16 KV cache 放不下 | `-ctk q4_0 -ctv q4_0` 量化 KV cache |
-| 第二个 ComfyUI 起不来 / 两个都崩 | 16 GB 装不下两份 | 启动脚本加 §5.5 端口检查 |
-| Ollama 和 llama.cpp 互相抢显存 | 无互斥 | 启动前跑 §3.3 的清场脚本 |
-| 跑分不可复现 | 从 `resolve/main/` 下的权重漂移了 | 固定到 `resolve/<commit>/` |
-| SDXL 加了 RDNA4 参数没变化 | SDXL 本来就不需要那套（§4.2） | 去掉，从模型/VAE/前端配置方向查 |
-| Open WebUI 打开就是报错页 | 服务还没就绪就开了浏览器 | 轮询 `/health` 就绪后再开（§8.1） |
-| Windows 上想看显存占用但没有 nvidia-smi | AMD 卡无此工具 | 读性能计数器 `\GPU Adapter Memory(*)\Dedicated Usage`（§8.1） |
-| H3 报 `'ModelSamplingAdvanced' object has no attribute 'audio_scale'` | `FLOW_AV` 需要支持音视频的采样节点 | 换采样节点（§6.5）。**与 RDNA4 无关**，NVIDIA 上同样报 |
-| 想判断模型有没有退化成 lowvram | 部分加载 ≠ lowvram 降级 | grep 日志 `lowvram patches:`，非 0 才是降级（§6.4） |
-| H3 很慢，调采样参数没用 | 瓶颈是加载不是计算，采样只占 20% | 权重挪到 SSD；日志里 `fast_disk=False` 就是慢盘标志（§6.4） |
+| First inference hangs, 25 minutes with zero output | TunableOp is broken on Windows + RDNA4 | Remove `PYTORCH_TUNABLEOP_ENABLED`, use `MIOPEN_FIND_MODE=FAST` |
+| ComfyUI process vanishes, no traceback, exit `0xC0000005` | `safetensors 0.8.0` access violation reading files > 21 GiB | Apply the §6.1 mmap patch |
+| pinned host memory allocation fails | ROCm doesn't support that path | Add `--disable-pinned-memory` |
+| ImportError around flash-attn / triton | No triton wheel for Windows ROCm | Add `--use-pytorch-cross-attention` |
+| HIP launch failure or extreme slowness at VAE decode | Multiple models co-resident in 16 GB (ComfyUI #15484) | Insert the §6.2 gate node before decode |
+| Images generate but quality is subtly worse | GGUF ships only the language tower; vision tower uninitialized | Restore it with the §5.3 encoder |
+| Diffusion suddenly slow, log mentions lowvram | ComfyUI freed only the shortfall → partial unload | Force a full unload via §5.4's `free_memory(1e30, ...)` |
+| 27B model OOMs after loading | fp16 KV cache doesn't fit | Quantize it: `-ctk q4_0 -ctv q4_0` |
+| Second ComfyUI won't start / both crash | 16 GB can't hold two | Add the §5.5 port check to the launcher |
+| Ollama and llama.cpp fight over VRAM | No mutual exclusion | Run the §3.3 teardown before starting |
+| Benchmarks not reproducible | Weights pulled from `resolve/main/` drifted | Pin to `resolve/<commit>/` |
+| SDXL unchanged after adding RDNA4 flags | SDXL never needed them (§4.2) | Remove them; look at the model / VAE / frontend config instead |
+| Open WebUI opens straight to an error page | Browser opened before the server was ready | Poll `/health` first (§8.1) |
+| Want VRAM usage on Windows but there's no nvidia-smi | No such tool for AMD | Read the counter `\GPU Adapter Memory(*)\Dedicated Usage` (§8.1) |
+| H3 raises `'ModelSamplingAdvanced' object has no attribute 'audio_scale'` | `FLOW_AV` needs an AV-capable sampling node | Switch nodes (§6.5). **Unrelated to RDNA4** — reproduces on NVIDIA |
+| Need to tell whether a model degraded to lowvram | Partial load ≠ lowvram degradation | grep the log for `lowvram patches:` — non-zero means degraded (§6.4) |
+| H3 is slow and sampler tuning does nothing | Loading is the bottleneck; sampling is only 20% | Move weights to an SSD; `fast_disk=False` in the log flags a slow disk (§6.4) |
 
 ---
 
-## 10. 已证伪清单
+## 10. Disproven options
 
-**看起来该开、实测必须关的选项。给建议前先看这里。**
+**Things that look like they should be enabled but must not be. Worth checking before advising.**
 
-| 选项 | 状态 | 证据 |
+| Option | Status | Evidence |
 |---|---|---|
-| `PYTORCH_TUNABLEOP_ENABLED=1` | ❌ **禁用** | Windows+RDNA4 上挂死，25 分钟零输出 |
-| `triton` 后端 | ❌ 不可用 | `ImportError: No module named 'triton'`，Windows ROCm 无 wheel |
-| pinned memory（默认开） | ❌ **必须关** | 分配失败，须 `--disable-pinned-memory` |
-| `nvfp4` / `mxfp8` 量化 | ❌ 不适用 | HIP 后端无对应算子，NVIDIA 专属 |
-| Ollama 走 ROCm | ⚠️ 当时不支持 | RDNA4 不在支持列表，**Vulkan 反而稳**，34/34 层全卸载 |
-| 1024×1024 以上不加 offload | ❌ 撞墙 | 峰值已达 15.9 GiB = 物理上限 |
-| 两份 ComfyUI 共存 | ❌ 不可能 | 16 GB 不够 |
-| 给 SDXL 套 RDNA4 workaround | ⚠️ **没必要** | 默认参数即可跑通，加了是白搭（§7） |
-| ForgeNeo 的 `--xformers` / `--cuda-malloc` 等 | ⚠️ 未采用 | `COMMANDLINE_ARGS` 留空就能跑，无需这些 |
+| `PYTORCH_TUNABLEOP_ENABLED=1` | ❌ **Disable** | Hangs on Windows + RDNA4; 25 minutes, zero output |
+| `triton` backend | ❌ Unavailable | `ImportError: No module named 'triton'` — no Windows ROCm wheel |
+| pinned memory (on by default) | ❌ **Must disable** | Allocation fails; requires `--disable-pinned-memory` |
+| `nvfp4` / `mxfp8` quantization | ⚠️ Emulated | Runs, but through software emulation — no native kernels, no speedup |
+| Ollama on ROCm | ⚠️ Unsupported at the time | RDNA4 not on the support list; **Vulkan is the stable path**, 34/34 layers offloaded |
+| Above 1024×1024 without offload | ❌ Hits the wall | Peak already at 15.9 GiB = physical limit |
+| Two ComfyUI instances | ❌ Impossible | 16 GB isn't enough |
+| RDNA4 workarounds for SDXL | ⚠️ **Unnecessary** | Defaults work; adding them buys nothing (§7) |
+| ForgeNeo's `--xformers` / `--cuda-malloc` etc. | ⚠️ Not used | An empty `COMMANDLINE_ARGS` works fine |
 
 ---
 
-## 11. 目录布局参考
+## 11. Directory layout
 
 ```
 E:\AI\Apps
-   ComfyUI/          三个实例共用一份代码，靠 --port / --extra-model-paths-config 区分
-   ForgeNeo/         SDXL 第二前端，与 ComfyUI 共用同一份权重
-   Ollama/           便携版 + 自定义 Modelfile
-   llama.cpp-rocm/   gfx120X 预编译包，自带 HIP 运行时
+   ComfyUI/          three instances share one checkout, separated by --port / --extra-model-paths-config
+   ForgeNeo/         second SDXL frontend, shares the same weights as ComfyUI
+   Ollama/           portable build + custom Modelfiles
+   llama.cpp-rocm/   prebuilt gfx120X package, bundles its own HIP runtime
    OpenWebUI/        venv + data
    SillyTavern/      Node.js
 E:\AI\Models
-   gguf/             llama.cpp 用的对话模型
+   gguf/             chat models for llama.cpp
    Image/            SDXL: Stable-diffusion/ Lora/ VAE/ ControlNet/ Upscale/
    Ollama/           blobs/ manifests/ metadata/
    QwenImage21/      diffusion_models/ text_encoders/ vae/ loras/
-E:\AI\Cache          huggingface/ miopen/ pip/ torch/   ← 全部离盘，系统盘不落缓存
-E:\AI\Projects       每个模型一个子目录：workflow + benchmark + environment-audit
-E:\AI\Data           Images/ Videos/ ComfyUI/（用户目录）
+E:\AI\Cache          huggingface/ miopen/ pip/ torch/   <- all off-drive, nothing on the system disk
+E:\AI\Projects       one subdirectory per model: workflow + benchmark + environment-audit
+E:\AI\Data           Images/ Videos/ ComfyUI/ (user directory)
 E:\AI\Logs
-F:\AI\Models\MiniMaxH3   H3 权重 53 GiB，单独放机械盘
+F:\AI\Models\MiniMaxH3   H3 weights, 53 GiB, on a separate mechanical drive
 ```
 
-**ComfyUI 一份代码跑三个实例**（SDXL :8188 / Qwen A-B :8190 / H3 :8192），
-靠三样东西隔离：`--port`、`--temp-directory`、`--extra-model-paths-config`。
-共用 `--user-directory`，所以节点布局和界面设置是共享的。
+**One ComfyUI checkout runs three instances** (SDXL :8188 / Qwen A-B :8190 / H3 :8192),
+isolated by three things: `--port`, `--temp-directory` and `--extra-model-paths-config`.
+They share `--user-directory`, so node layout and UI settings are shared.
 
-每个项目目录里固定放三样东西，这是能复现跑分的原因：
+Each project directory always holds these three files — this is why the benchmarks are reproducible:
 
-- `environment-audit.json` —— 包版本 + GPU 属性 + 每个权重的 SHA256 与官方值对比 + ComfyUI git commit
-- `kernel-probe.json` —— 各后端实际可用算子清单 + int8 数值校验
-- `*.result.json` —— 每次跑分的 wall time + 完整显存指标
-
----
-
-## 覆盖范围与边界
-
-**已验证**：「已部署清单」里的全部条目，在 §1 基线环境下实测。
-
-**未验证 / 不保证**：
-
-- **stable-diffusion.cpp 的 Vulkan 路线** —— 写过对照跑分脚本，但 `sd-cli.exe` 从未实际安装，
-  所以**本文没有 Vulkan vs ROCm 的生图对照数据**。别把 §3.1 的 Ollama Vulkan 结论外推到生图。
-- 其他 RDNA4 型号（9070 非 XT、9060 等）—— 显存和 CU 数不同，跑分不适用，环境变量结论大概率仍成立
-- RDNA3（gfx110x）—— 算子能力表需重测
-- Linux ROCm —— triton 可用，本文多处结论（`--use-pytorch-cross-attention`、TunableOp）不适用
-- WSL2 —— 未测
-- 多模型**同时**运行 —— 全部方案都是互斥运行，共驻只在 §6.2 作为失败案例出现
-
-**许可**：本仓库的文档与自研节点代码 MIT。第三方模型权重各自遵循其原始许可，本仓库不再分发。
+- `environment-audit.json` — package versions + GPU properties + each weight's SHA256 against
+  the official value + the ComfyUI git commit
+- `kernel-probe.json` — the actual per-backend kernel list + int8 numerical check
+- `*.result.json` — per-run wall time + full VRAM metrics
 
 ---
 
-## 如果这份文档帮到了你
+## Scope and limits
 
-这些参数是在一张 16 GB 卡上反复撞墙试出来的 —— TunableOp 那 25 分钟、
-safetensors 那个 `0xC0000005`、GGUF 缺视觉塔导致的静默降质，
-每一条都花了不少时间才定位。
+**Verified**: every entry in the deployment inventory, measured in the §1 baseline environment.
 
-**如果它省了你几个小时，请点个 Star ⭐** —— 这能让更多 RDNA4 用户搜到它。
+**Not verified / not guaranteed**:
 
-有新的踩坑、或在别的 RDNA4 / RDNA3 卡上跑出了不同结果，欢迎开 Issue 或 PR 补充。
-尤其欢迎补充：其他 RDNA4 型号的跑分、Linux ROCm 的对照数据、safetensors 那个 bug 的上游修复进展。
+- **The stable-diffusion.cpp Vulkan route** — a comparison benchmark script exists, but
+  `sd-cli.exe` was never actually installed, so **this document has no Vulkan-vs-ROCm image
+  generation data**. Do not extrapolate the §3.1 Ollama Vulkan result to image generation.
+- Other RDNA4 parts (9070 non-XT, 9060, etc.) — different VRAM and CU counts, so benchmarks
+  don't transfer; the environment-variable conclusions most likely still do
+- RDNA3 (gfx110x) — the kernel capability table needs re-measuring
+- Linux ROCm — triton is available there, so several conclusions here
+  (`--use-pytorch-cross-attention`, TunableOp) do not apply
+- WSL2 — untested
+- Running multiple models **concurrently** — every setup here is mutually exclusive;
+  co-residency appears only as a failure case in §6.2
+
+**License**: the documentation and custom node code in this repository are MIT. Third-party
+model weights remain under their own licenses and are not redistributed here.
+
+---
+
+## If this saved you time
+
+These parameters were found by repeatedly hitting walls on a single 16 GB card — the
+25 minutes lost to TunableOp, the `0xC0000005` from safetensors, the silent quality loss from
+a GGUF missing its vision tower. Each one took a while to pin down.
+
+**If it saved you a few hours, please leave a Star ⭐** — it helps other RDNA4 users find it.
+
+Found new problems, or different results on another RDNA4 / RDNA3 card? Issues and PRs
+welcome. Especially valuable: benchmarks from other RDNA4 parts, Linux ROCm comparison data,
+and any upstream progress on the safetensors bug.
